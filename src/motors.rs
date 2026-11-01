@@ -114,10 +114,12 @@ pub fn command_mixer_system(
                     + 8.0 * (vel.y - linvel.0.y)
                     - 2.0 * linvel.0.y)
                     .clamp(0.0, cfg.mass * 9.81 * 2.0);
-                let (cur_roll, cur_pitch, _) = tf.rotation.to_euler(EulerRot::XYZ);
+                // to_euler(XYZ) with Y up: .0 = pitch (nose up/down around body X), .2 = roll (wing left/right around body Z)
+                let (cur_pitch, _, cur_roll) = tf.rotation.to_euler(EulerRot::XYZ);
                 let angvel_body = tf.rotation.inverse() * angvel.0;
-                let torque_x = 8.0 * (roll - cur_roll) - 2.0 * angvel_body.x;
-                let torque_z = 8.0 * (pitch - cur_pitch) - 2.0 * angvel_body.z;
+                // torque_x = pitch control; torque_z = roll control
+                let torque_x = 8.0 * (pitch - cur_pitch) - 2.0 * angvel_body.x;
+                let torque_z = 8.0 * (roll - cur_roll) - 2.0 * angvel_body.z;
                 let torque_y = 2.0 * (yaw_rate - angvel_body.y);
                 mix_thrust_torque(&cfg, thrust, Vec3::new(torque_x, torque_y, torque_z))
             }
@@ -127,10 +129,11 @@ pub fn command_mixer_system(
                 let pitch = (vel.z * 0.1).clamp(-0.3, 0.3);
                 let roll = (-vel.x * 0.1).clamp(-0.3, 0.3);
                 let thrust = cfg.mass * 9.81;
-                let (cur_roll, cur_pitch, _) = tf.rotation.to_euler(EulerRot::XYZ);
+                // to_euler(XYZ) with Y up: .0 = pitch, .2 = roll
+                let (cur_pitch, _, cur_roll) = tf.rotation.to_euler(EulerRot::XYZ);
                 let angvel_body = tf.rotation.inverse() * angvel.0;
-                let torque_x = 4.0 * (roll - cur_roll) - 1.5 * angvel_body.x;
-                let torque_z = 4.0 * (pitch - cur_pitch) - 1.5 * angvel_body.z;
+                let torque_x = 4.0 * (pitch - cur_pitch) - 1.5 * angvel_body.x;
+                let torque_z = 4.0 * (roll - cur_roll) - 1.5 * angvel_body.z;
                 mix_thrust_torque(&cfg, thrust, Vec3::new(torque_x, 0.0, torque_z))
             }
             DroneCommand::None => mix_thrust_torque(&cfg, cfg.mass * 9.81, Vec3::ZERO),
