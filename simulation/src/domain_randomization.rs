@@ -1,7 +1,5 @@
-use crate::config::{
-    DomainRandomizationConfig, DroneConfig, EnvironmentConfig, NetworkConfig, SensorConfig,
-};
-use crate::motors::{Drone, Motors};
+use crate::config::{DomainRandomizationConfig, DroneConfig, EnvironmentConfig, SensorConfig};
+use crate::motors::Motors;
 use avian3d::prelude::*;
 use bevy::prelude::*;
 use rand::Rng;
@@ -9,11 +7,13 @@ use rand::Rng;
 #[derive(Resource, Default)]
 pub struct ResetRequest(pub bool);
 
+#[derive(Resource, Default)]
+pub struct ResetGeneration(pub u64);
+
 pub fn apply_domain_randomization(
     mut drone_cfg: ResMut<DroneConfig>,
     mut sensor_cfg: ResMut<SensorConfig>,
     mut env_cfg: ResMut<EnvironmentConfig>,
-    mut net_cfg: ResMut<NetworkConfig>,
     dr: Res<DomainRandomizationConfig>,
 ) {
     if !dr.enabled {
@@ -52,34 +52,82 @@ pub fn apply_domain_randomization(
     env_cfg.wind_gust_intensity = rng.gen_range(dr.wind_range.0..=dr.wind_range.1);
     env_cfg.temperature_c = rng.gen_range(dr.temp_range.0..=dr.temp_range.1);
     env_cfg.update_air_density();
-    net_cfg.latency_ms = rng.gen_range(dr.latency_range.0..=dr.latency_range.1);
-    net_cfg.packet_loss = rng.gen_range(dr.packet_loss_range.0..=dr.packet_loss_range.1);
 }
 
-pub fn reset_drone_system(
+pub fn reset_aircraft_system(
     mut reset: ResMut<ResetRequest>,
+    mut generation: ResMut<ResetGeneration>,
+    mut rpms: ResMut<crate::motor_rpms::MotorRPMs>,
+    mut telemetry: ResMut<crate::sensors::Telemetry>,
+    mut mavlink: ResMut<crate::mavlink::MavlinkInterface>,
+    mut prev_velocity: ResMut<crate::sensors::PrevVelocity>,
     mut query: Query<
         (
             &mut Transform,
+            &mut Position,
+            &mut Rotation,
             &mut LinearVelocity,
             &mut AngularVelocity,
-            &mut Motors,
+            Option<&mut Motors>,
+            Option<&mut crate::motors::CommandInput>,
+            Option<&mut CollidingEntities>,
+            Option<&mut crate::aircraft::Propulsion>,
+            Option<&mut crate::aircraft::AircraftControls>,
         ),
-        With<Drone>,
+        With<crate::aircraft::Aircraft>,
     >,
 ) {
     if !reset.0 {
         return;
     }
-    for (mut tf, mut lv, mut av, mut motors) in &mut query {
-        tf.translation = Vec3::new(0.0, 2.0, 0.0);
-        tf.rotation = Quat::IDENTITY;
+    for (
+        mut tf,
+        mut position,
+        mut rotation,
+        mut lv,
+        mut av,
+        motors,
+        input,
+        contacts,
+        propulsion,
+        controls,
+    ) in &mut query
+    {
+        *tf = Transform::from_xyz(0.0, 2.0, 0.0);
+        position.0 = tf.translation;
+        rotation.0 = Quat::IDENTITY;
         lv.0 = Vec3::ZERO;
         av.0 = Vec3::ZERO;
-        for m in &mut motors.states {
-            m.rpm = 0.0;
-            m.target_rpm = 0.0;
+        if let Some(mut motors) = motors {
+            *motors = Motors::default();
+        }
+        if let Some(mut input) = input {
+            input.command = crate::motors::DroneCommand::None;
+        }
+        if let Some(mut contacts) = contacts {
+            contacts.clear();
+        }
+        if let Some(mut propulsion) = propulsion {
+            for propulsor in &mut propulsion.0 {
+                propulsor.throttle = 0.0;
+            }
+        }
+        if let Some(mut controls) = controls {
+            controls.propulsion.fill(0.0);
+            controls.surfaces.fill(0.0);
         }
     }
+    *rpms = crate::motor_rpms::MotorRPMs::default();
+    mavlink.armed = false;
+    mavlink.external_control = false;
+    mavlink.guided_target = None;
+    mavlink.last_velocity_setpoint_secs = None;
+    *telemetry = crate::sensors::Telemetry {
+        position: Vec3::new(0.0, 2.0, 0.0),
+        rotation: Quat::IDENTITY,
+        ..default()
+    };
+    prev_velocity.0 = Vec3::ZERO;
+    generation.0 = generation.0.wrapping_add(1);
     reset.0 = false;
 }

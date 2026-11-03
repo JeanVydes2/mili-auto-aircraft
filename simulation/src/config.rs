@@ -24,6 +24,23 @@ impl Default for SimConfig {
 #[derive(Resource, Default)]
 pub struct GizmosEnabled(pub bool);
 
+#[derive(Resource, Clone, Copy, Debug)]
+pub struct FlightControlLimits {
+    pub max_speed_m_s: f32,
+    pub max_acceleration_m_s2: f32,
+    pub max_tilt_deg: f32,
+}
+
+impl Default for FlightControlLimits {
+    fn default() -> Self {
+        Self {
+            max_speed_m_s: 8.0,
+            max_acceleration_m_s2: 8.0,
+            max_tilt_deg: 26.0,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct MotorConfig {
     pub position: Vec3,
@@ -45,7 +62,7 @@ impl Default for MotorConfig {
             position: Vec3::ZERO,
             rotation_dir: 1.0,
             thrust_coeff: 1.0e-5,
-            torque_coeff: 1.5e-6,
+            torque_coeff: 1.5e-7,
             min_rpm: 0.0,
             max_rpm: 9000.0,
             time_constant: 0.02,
@@ -112,12 +129,12 @@ pub struct EnvironmentConfig {
     pub temperature_c: f32,
     pub pressure_pa: f32,
     pub humidity: f32,
-    pub wind_constant: Vec3,
-    pub wind_gust_intensity: f32,
-    pub wind_gust_duration: f32,
+    pub wind_constant: Vec3,      // World air velocity (m/s).
+    pub wind_gust_intensity: f32, // Peak gust speed (m/s).
+    pub wind_gust_duration: f32,  // Gust period (s).
     pub wind_gust_direction: Vec3,
-    pub turbulence_intensity: f32,
-    pub turbulence_length_scale: f32,
+    pub turbulence_intensity: f32, // Turbulence speed amplitude (m/s).
+    pub turbulence_length_scale: f32, // Spatial correlation length (m).
     pub altitude_m: f32,
 }
 
@@ -129,11 +146,11 @@ impl Default for EnvironmentConfig {
             temperature_c: 20.0,
             pressure_pa: 101325.0,
             humidity: 0.5,
-            wind_constant: Vec3::ZERO,
-            wind_gust_intensity: 0.0,
-            wind_gust_duration: 2.0,
+            wind_constant: Vec3::new(1.0, 0.0, 0.5),
+            wind_gust_intensity: 1.5,
+            wind_gust_duration: 6.0,
             wind_gust_direction: Vec3::X,
-            turbulence_intensity: 0.0,
+            turbulence_intensity: 0.35,
             turbulence_length_scale: 5.0,
             altitude_m: 0.0,
         }
@@ -252,8 +269,8 @@ impl Default for SensorConfig {
             gps_multipath: 0.0,
             current_noise: 0.05,
             voltage_noise: 0.05,
-            camera_width: 320,
-            camera_height: 240,
+            camera_width: 640,
+            camera_height: 360,
             camera_fov_deg: 90.0,
             camera_fps: 30.0,
             camera_distortion: 0.0,
@@ -263,31 +280,6 @@ impl Default for SensorConfig {
             camera_iso_noise: 0.0,
             sensor_delay_ms: 0.0,
             sensor_dropout_prob: 0.0,
-        }
-    }
-}
-
-#[derive(Resource, Clone, Debug)]
-pub struct NetworkConfig {
-    pub enabled: bool,
-    pub latency_ms: f32,
-    pub jitter_ms: f32,
-    pub packet_loss: f32,
-    pub corrupt_prob: f32,
-    pub bandwidth_kbps: f32,
-    pub protocol_udp: bool,
-}
-
-impl Default for NetworkConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            latency_ms: 30.0,
-            jitter_ms: 5.0,
-            packet_loss: 0.0,
-            corrupt_prob: 0.0,
-            bandwidth_kbps: 1000.0,
-            protocol_udp: true,
         }
     }
 }
@@ -321,8 +313,6 @@ pub struct DomainRandomizationConfig {
     pub sensor_bias_range: f32,
     pub wind_range: (f32, f32),
     pub temp_range: (f32, f32),
-    pub latency_range: (f32, f32),
-    pub packet_loss_range: (f32, f32),
     pub lighting_range: (f32, f32),
 }
 
@@ -339,8 +329,6 @@ impl Default for DomainRandomizationConfig {
             sensor_bias_range: 0.1,
             wind_range: (0.0, 5.0),
             temp_range: (0.0, 40.0),
-            latency_range: (0.0, 80.0),
-            packet_loss_range: (0.0, 0.1),
             lighting_range: (0.5, 1.5),
         }
     }

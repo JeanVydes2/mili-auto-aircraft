@@ -1,6 +1,6 @@
-use crate::config::{BatteryState, SensorConfig, SimConfig};
+use crate::aircraft::Aircraft;
+use crate::config::{BatteryState, EnvironmentConfig, SensorConfig};
 use crate::motor_rpms::MotorRPMs;
-use crate::motors::{Drone, Motors};
 use avian3d::prelude::*;
 use bevy::prelude::*;
 use rand::Rng;
@@ -28,30 +28,21 @@ pub struct PrevVelocity(pub Vec3);
 
 pub fn update_telemetry_system(
     time: Res<Time>,
-    sim: Res<SimConfig>,
+    env: Res<EnvironmentConfig>,
     sensor_cfg: Res<SensorConfig>,
     batt: Res<BatteryState>,
     motor_rpms: Res<MotorRPMs>,
     mut prev: ResMut<PrevVelocity>,
     mut telemetry: ResMut<Telemetry>,
-    query: Query<
-        (
-            Entity,
-            &Transform,
-            &LinearVelocity,
-            &AngularVelocity,
-            &Motors,
-        ),
-        With<Drone>,
-    >,
+    query: Query<(&Transform, &LinearVelocity, &AngularVelocity), With<Aircraft>>,
 ) {
     let dt = time.delta_secs().max(1e-4);
-    for (entity, tf, linvel, angvel, motors) in &query {
+    for (tf, linvel, angvel) in &query {
         let rot = tf.rotation;
         let accel_world = (linvel.0 - prev.0) / dt;
         prev.0 = linvel.0;
 
-        let gravity = Vec3::new(0.0, -sim.gravity, 0.0);
+        let gravity = Vec3::new(0.0, -env.gravity, 0.0);
         let specific_force_world = accel_world - gravity;
 
         let mut rng = rand::thread_rng();
@@ -110,10 +101,8 @@ pub fn update_telemetry_system(
         telemetry.battery_voltage = batt.voltage;
         telemetry.battery_current = batt.current_a;
         telemetry.motor_rpms = motor_rpms.rpms;
-        bevy::log::info!("sensor: rpms={:?}", telemetry.motor_rpms);
-        // Log once per second using a simple timer.
         let elapsed = time.elapsed_secs();
-        if (elapsed * 10.0).floor() != ((elapsed - dt) * 10.0).floor() {
+        if elapsed.floor() != (elapsed - dt).floor() {
             bevy::log::info!(
                 "drone pos {:?} vel {:?} rot {:?} rpms {:?}",
                 telemetry.position,

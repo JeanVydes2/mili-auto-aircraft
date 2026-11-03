@@ -1,0 +1,19 @@
+[package]
+name = "drone_sim"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bevy = "0.20.1"
+bevy_ui_widgets = "0.20.1"
+avian3d = "0.8.0"
+mavlink = { version = "0.21", default-features = false, features = ["std", "transport-udp", "dialect-common"] }
+rand = "0.8"
+rand_distr = "0.4"
+serde = { version = "1", features = ["derive"] }
+toml = "0.9"
+log = { version = "*", features = ["max_level_debug", "release_max_level_warn"] }
+
+[[bin]]
+name = "drone_sim"
+path = "src/main.rs"

@@ -1,0 +1,80 @@
+# Editable rigid-body properties for each aircraft profile.
+# Lengths are metres, mass is kg, inertia is kg*m^2, and drag is body-frame.
+
+[[aircraft]]
+kind = "quad"
+mass = 1.5
+inertia = [0.029, 0.055, 0.029]
+center_of_mass = [0.0, 0.0, 0.0]
+linear_drag = [0.1, 0.1, 0.1]
+quadratic_drag = [0.01, 0.01, 0.01]
+angular_drag = [0.05, 0.05, 0.05]
+collider_half_extents = [0.35, 0.06, 0.35]
+propulsion = [
+  { position = [0.22, 0.0, 0.22], axis = [0.0, 1.0, 0.0], max_thrust = 8.88, reaction_torque = 0.133, response_time = 0.02, control_channel = 0 },
+  { position = [-0.22, 0.0, 0.22], axis = [0.0, 1.0, 0.0], max_thrust = 8.88, reaction_torque = -0.133, response_time = 0.02, control_channel = 1 },
+  { position = [-0.22, 0.0, -0.22], axis = [0.0, 1.0, 0.0], max_thrust = 8.88, reaction_torque = 0.133, response_time = 0.02, control_channel = 2 },
+  { position = [0.22, 0.0, -0.22], axis = [0.0, 1.0, 0.0], max_thrust = 8.88, reaction_torque = -0.133, response_time = 0.02, control_channel = 3 },
+]
+surfaces = []
+
+[[aircraft]]
+kind = "hex"
+mass = 2.5
+inertia = [0.12, 0.20, 0.12]
+center_of_mass = [0.0, 0.0, 0.0]
+linear_drag = [0.14, 0.14, 0.14]
+quadratic_drag = [0.015, 0.015, 0.015]
+angular_drag = [0.08, 0.08, 0.08]
+collider_half_extents = [0.55, 0.08, 0.55]
+propulsion = [
+  { position = [0.2475, 0.0, 0.2475], axis = [0.0, 1.0, 0.0], max_thrust = 11.0, reaction_torque = 0.18, response_time = 0.02, control_channel = 0 },
+  { position = [-0.2475, 0.0, 0.2475], axis = [0.0, 1.0, 0.0], max_thrust = 11.0, reaction_torque = -0.18, response_time = 0.02, control_channel = 1 },
+  { position = [-0.495, 0.0, 0.0], axis = [0.0, 1.0, 0.0], max_thrust = 11.0, reaction_torque = 0.18, response_time = 0.02, control_channel = 2 },
+  { position = [-0.2475, 0.0, -0.2475], axis = [0.0, 1.0, 0.0], max_thrust = 11.0, reaction_torque = -0.18, response_time = 0.02, control_channel = 3 },
+  { position = [0.2475, 0.0, -0.2475], axis = [0.0, 1.0, 0.0], max_thrust = 11.0, reaction_torque = 0.18, response_time = 0.02, control_channel = 4 },
+  { position = [0.495, 0.0, 0.0], axis = [0.0, 1.0, 0.0], max_thrust = 11.0, reaction_torque = -0.18, response_time = 0.02, control_channel = 5 },
+]
+surfaces = []
+
+[[aircraft]]
+kind = "fixed_wing"
+mass = 3.0
+inertia = [0.35, 0.18, 0.48]
+center_of_mass = [0.0, 0.0, 0.0]
+linear_drag = [0.03, 0.03, 0.03]
+quadratic_drag = [0.08, 0.12, 0.035]
+angular_drag = [0.12, 0.12, 0.12]
+collider_half_extents = [0.9, 0.12, 0.55]
+propulsion = [
+  { position = [0.0, 0.0, 0.22], axis = [0.0, 0.0, 1.0], max_thrust = 24.0, reaction_torque = 0.12, response_time = 0.08, control_channel = 0 },
+]
+surfaces = [
+  { position = [-0.42, 0.0, 0.0], chord_axis = [0.0, 0.0, 1.0], lift_axis = [0.0, 1.0, 0.0], area = 0.399, zero_lift_angle = 0.0, lift_slope = 5.2, max_lift_coefficient = 1.35, zero_lift_drag = 0.025, induced_drag = 0.055, control_channel = 1, control_sign = -1.0, control_lift = 1.4 },
+  { position = [0.42, 0.0, 0.0], chord_axis = [0.0, 0.0, 1.0], lift_axis = [0.0, 1.0, 0.0], area = 0.399, zero_lift_angle = 0.0, lift_slope = 5.2, max_lift_coefficient = 1.35, zero_lift_drag = 0.025, induced_drag = 0.055, control_channel = 1, control_sign = 1.0, control_lift = 1.4 },
+  { position = [0.0, 0.0, -0.48], chord_axis = [0.0, 0.0, 1.0], lift_axis = [0.0, 1.0, 0.0], area = 0.152, zero_lift_angle = 0.0, lift_slope = 5.2, max_lift_coefficient = 1.35, zero_lift_drag = 0.025, induced_drag = 0.055, control_channel = 2, control_sign = -1.0, control_lift = 1.7 },
+  { position = [0.0, 0.16, -0.40], chord_axis = [0.0, 0.0, 1.0], lift_axis = [1.0, 0.0, 0.0], area = 0.076, zero_lift_angle = 0.0, lift_slope = 3.5, max_lift_coefficient = 1.0, zero_lift_drag = 0.04, induced_drag = 0.04, control_channel = 3, control_sign = 1.0, control_lift = 1.5 },
+]
+
+[[aircraft]]
+kind = "vtol"
+mass = 4.0
+inertia = [0.48, 0.62, 0.45]
+center_of_mass = [0.0, 0.0, 0.0]
+linear_drag = [0.06, 0.06, 0.06]
+quadratic_drag = [0.08, 0.1, 0.04]
+angular_drag = [0.1, 0.1, 0.1]
+collider_half_extents = [0.75, 0.12, 0.65]
+propulsion = [
+  { position = [-0.55, 0.0, -0.45], axis = [0.0, 1.0, 0.0], max_thrust = 15.0, reaction_torque = 0.2, response_time = 0.025, control_channel = 0 },
+  { position = [0.55, 0.0, -0.45], axis = [0.0, 1.0, 0.0], max_thrust = 15.0, reaction_torque = -0.2, response_time = 0.025, control_channel = 1 },
+  { position = [-0.55, 0.0, 0.45], axis = [0.0, 1.0, 0.0], max_thrust = 15.0, reaction_torque = 0.2, response_time = 0.025, control_channel = 2 },
+  { position = [0.55, 0.0, 0.45], axis = [0.0, 1.0, 0.0], max_thrust = 15.0, reaction_torque = -0.2, response_time = 0.025, control_channel = 3 },
+  { position = [0.0, 0.0, 0.28], axis = [0.0, 0.0, 1.0], max_thrust = 24.0, reaction_torque = 0.12, response_time = 0.08, control_channel = 4 },
+]
+surfaces = [
+  { position = [-0.42, 0.0, 0.0], chord_axis = [0.0, 0.0, 1.0], lift_axis = [0.0, 1.0, 0.0], area = 0.546, zero_lift_angle = 0.0, lift_slope = 5.2, max_lift_coefficient = 1.35, zero_lift_drag = 0.025, induced_drag = 0.055, control_channel = 1, control_sign = -1.0, control_lift = 1.4 },
+  { position = [0.42, 0.0, 0.0], chord_axis = [0.0, 0.0, 1.0], lift_axis = [0.0, 1.0, 0.0], area = 0.546, zero_lift_angle = 0.0, lift_slope = 5.2, max_lift_coefficient = 1.35, zero_lift_drag = 0.025, induced_drag = 0.055, control_channel = 1, control_sign = 1.0, control_lift = 1.4 },
+  { position = [0.0, 0.0, -0.48], chord_axis = [0.0, 0.0, 1.0], lift_axis = [0.0, 1.0, 0.0], area = 0.208, zero_lift_angle = 0.0, lift_slope = 5.2, max_lift_coefficient = 1.35, zero_lift_drag = 0.025, induced_drag = 0.055, control_channel = 2, control_sign = -1.0, control_lift = 1.7 },
+  { position = [0.0, 0.16, -0.40], chord_axis = [0.0, 0.0, 1.0], lift_axis = [1.0, 0.0, 0.0], area = 0.104, zero_lift_angle = 0.0, lift_slope = 3.5, max_lift_coefficient = 1.0, zero_lift_drag = 0.04, induced_drag = 0.04, control_channel = 3, control_sign = 1.0, control_lift = 1.5 },
+]
