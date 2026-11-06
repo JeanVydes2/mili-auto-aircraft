@@ -705,21 +705,21 @@ fn sock_rotation(wind: Vec3, elapsed: f32) -> Quat {
 
 /// Reads actual motor RPM (not target RPM). Only the rotor and windsock local
 /// rotations change; the Drone's physics-controlled Transform is never queried.
+/// MotorRPMs lives on the parent drone, so rotors are matched through the
+/// hierarchy (ChildOf -> Ancestors).
 pub fn animate_visuals(
     time: Res<Time>,
-    rpms: Option<Res<MotorRPMs>>,
     wind: Option<Res<CurrentWind>>,
-    mut rotors: Query<(&RotorVisual, &mut Transform), Without<WindsockVisual>>,
+    mut rotors: Query<(&RotorVisual, &ChildOf, &mut Transform), Without<WindsockVisual>>,
+    rpms: Query<&MotorRPMs>,
     mut socks: Query<&mut Transform, (With<WindsockVisual>, Without<RotorVisual>)>,
 ) {
-    if let Some(rpms) = rpms {
-        for (rotor, mut tf) in &mut rotors {
-            tf.rotate_y(rotor_step(
-                rpms.rpms[rotor.motor],
-                rotor.direction,
-                time.delta_secs(),
-            ));
-        }
+    for (rotor, parent, mut tf) in &mut rotors {
+        let rpm = rpms
+            .get(parent.parent())
+            .map(|r| r.rpms[rotor.motor])
+            .unwrap_or(0.0);
+        tf.rotate_y(rotor_step(rpm, rotor.direction, time.delta_secs()));
     }
     let rotation = sock_rotation(wind.map_or(Vec3::ZERO, |wind| wind.0), time.elapsed_secs());
     for mut tf in &mut socks {
@@ -842,12 +842,16 @@ mod tests {
         let mut app = app_with_assets();
         let drone = app
             .world_mut()
-            .spawn((Drone, Transform::IDENTITY, Visibility::default()))
+            .spawn((
+                Drone,
+                Transform::IDENTITY,
+                Visibility::default(),
+                MotorRPMs {
+                    rpms: [15.0, 0.0, 0.0, 0.0],
+                    target_rpms: [9000.0; 4],
+                },
+            ))
             .id();
-        app.insert_resource(MotorRPMs {
-            rpms: [15.0, 0.0, 0.0, 0.0],
-            target_rpms: [9000.0; 4],
-        });
         app.insert_resource(CurrentWind(Vec3::X * 5.0));
         app.world_mut()
             .resource_mut::<Time>()

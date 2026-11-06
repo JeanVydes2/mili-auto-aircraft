@@ -1,12 +1,13 @@
 use crate::aircraft::Aircraft;
 use crate::config::{BatteryState, EnvironmentConfig, SensorConfig};
 use crate::motor_rpms::MotorRPMs;
+use crate::motors::Drone;
 use avian3d::prelude::*;
 use bevy::prelude::*;
 use rand::Rng;
 use rand_distr::{Distribution, Normal};
 
-#[derive(Resource, Default, Clone, Debug)]
+#[derive(Component, Default, Clone, Debug)]
 pub struct Telemetry {
     pub position: Vec3,
     pub rotation: Quat,
@@ -23,21 +24,28 @@ pub struct Telemetry {
     pub motor_rpms: [f32; 4],
 }
 
-#[derive(Resource, Default)]
+#[derive(Component, Default)]
 pub struct PrevVelocity(pub Vec3);
 
 pub fn update_telemetry_system(
     time: Res<Time>,
     env: Res<EnvironmentConfig>,
     sensor_cfg: Res<SensorConfig>,
-    batt: Res<BatteryState>,
-    motor_rpms: Res<MotorRPMs>,
-    mut prev: ResMut<PrevVelocity>,
-    mut telemetry: ResMut<Telemetry>,
-    query: Query<(&Transform, &LinearVelocity, &AngularVelocity), With<Aircraft>>,
+    mut query: Query<
+        (
+            &Transform,
+            &LinearVelocity,
+            &AngularVelocity,
+            &MotorRPMs,
+            &BatteryState,
+            &mut Telemetry,
+            &mut PrevVelocity,
+        ),
+        With<Aircraft>,
+    >,
 ) {
     let dt = time.delta_secs().max(1e-4);
-    for (tf, linvel, angvel) in &query {
+    for (tf, linvel, angvel, motor_rpms, batt, mut telemetry, mut prev) in &mut query {
         let rot = tf.rotation;
         let accel_world = (linvel.0 - prev.0) / dt;
         prev.0 = linvel.0;

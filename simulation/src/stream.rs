@@ -1,6 +1,6 @@
 //! A bounded, simulated digital video link carrying actual GPU camera pixels.
 //! Bitrate/packetization and decoder dependencies are modeled, not a real codec.
-use crate::camera::{CameraFrameBuffer, FrameCamera};
+use crate::camera::{CameraFrameBuffers, FrameCamera};
 use crate::config::SensorConfig;
 use crate::domain_randomization::ResetGeneration;
 use bevy::asset::RenderAssetUsages;
@@ -19,6 +19,19 @@ pub enum VideoProfile {
     Nominal,
     Poor,
     Lost,
+}
+
+impl VideoProfile {
+    /// Parses `clean|nominal|poor|lost` (case-insensitive); `None` if unknown.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name.to_ascii_lowercase().as_str() {
+            "clean" => Some(Self::Clean),
+            "nominal" => Some(Self::Nominal),
+            "poor" => Some(Self::Poor),
+            "lost" => Some(Self::Lost),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Resource, Clone)]
@@ -88,7 +101,14 @@ impl VideoLinkConfig {
 
 impl Default for VideoLinkConfig {
     fn default() -> Self {
-        Self::for_profile(VideoProfile::Nominal)
+        // VYDE_VIDEO_PROFILE=clean|nominal|poor|lost (e.g. in remote
+        // production, where there is no keyboard to press V). Without the
+        // variable, the default profile is Nominal and is changed live with V.
+        let profile = std::env::var("VYDE_VIDEO_PROFILE")
+            .ok()
+            .and_then(|name| VideoProfile::from_name(&name))
+            .unwrap_or(VideoProfile::Nominal);
+        Self::for_profile(profile)
     }
 }
 
@@ -152,13 +172,83 @@ pub struct StreamDisplay {
     pub height: u32,
 }
 
+/// Per-vehicle receiver displays (the image shown in the ground-station UI).
+/// Index == `VehicleIndex`. Vehicle 0 mirrors the legacy `StreamDisplay`.
+#[derive(Resource, Default)]
+pub struct StreamDisplays {
+    pub displays: Vec<StreamDisplay>,
+}
+
 #[derive(Resource, Default)]
 pub struct ReceiverView(pub bool);
 
 #[derive(Resource, Default)]
 pub struct VideoOutput {
-    sender: Option<SyncSender<Vec<u8>>>,
-    disconnected: bool,
+    // Index 0 is the legacy single feed (vehicle 1); additional entries are
+    // per-vehicle feeds on successive UDP ports (see `video_output_url`).
+    senders: Vec<Option<SyncSender<Vec<u8>>>>,
+    disconnected: Vec<bool>,
+}
+
+impl VideoOutput {
+    /// Number of encoder feeds started (1 = single drone legacy behavior).
+    pub fn feed_count(&self) -> usize {
+        self.senders.len()
+    }
+
+    fn try_send(&mut self, feed: usize, pixels: Vec<u8>) {
+        let Some(sender) = self.senders.get(feed).and_then(Option::as_ref) else {
+            return;
+        };
+        match sender.try_send(pixels) {
+            Ok(()) | Err(TrySendError::Full(_)) => {}
+            Err(TrySendError::Disconnected(_)) => {
+                let already = self.disconnected.get(feed).copied().unwrap_or(true);
+                if !already {
+                    bevy::log::error!("FPV encoder worker {feed} disconnected");
+                    if let Some(flag) = self.disconnected.get_mut(feed) {
+                        *flag = true;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Resolve the ffmpeg output URL for a video feed.
+/// Feed 0 keeps the legacy `VYDE_VIDEO_OUTPUT` / `udp://127.0.0.1:5600` default
+/// so single-drone setups are unchanged. Feeds 1.. get `...:5601`, `...:5602`, ...
+/// by bumping the port. Non-UDP URLs (e.g. RTSP) and explicit per-feed vars
+/// (`VYDE_VIDEO_OUTPUT_2`, ...) are used verbatim.
+fn video_output_url(feed: usize) -> String {
+    if feed > 0 {
+        if let Ok(url) = std::env::var(format!("VYDE_VIDEO_OUTPUT_{}", feed + 1)) {
+            return url;
+        }
+    }
+    let base = std::env::var("VYDE_VIDEO_OUTPUT")
+        .unwrap_or_else(|_| "udp://127.0.0.1:5600?pkt_size=1316".to_owned());
+    if feed == 0 {
+        return base;
+    }
+    if let Some(rest) = base.strip_prefix("udp://") {
+        let (host_port, suffix) = match rest.split_once('?') {
+            Some((hp, tail)) => (hp, Some(tail)),
+            None => (rest, None),
+        };
+        if let Some((host, port)) = host_port.rsplit_once(':') {
+            if let Ok(port_num) = port.parse::<u16>() {
+                let url = format!(
+                    "udp://{}:{}{}",
+                    host,
+                    port_num + feed as u16,
+                    suffix.map_or_else(String::new, |tail| format!("?{tail}"))
+                );
+                return url;
+            }
+        }
+    }
+    base
 }
 
 #[derive(Component)]
@@ -169,6 +259,7 @@ pub struct CaptureRequest {
     generation: u64,
     width: u32,
     height: u32,
+    vehicle: usize,
 }
 
 struct VideoFrame {
@@ -197,6 +288,46 @@ pub struct VideoReceiver {
     last_paint: f64,
     previous_latency: Option<f32>,
     samples: VecDeque<(f64, f64)>,
+}
+
+/// Per-vehicle video receivers. Index == `VehicleIndex`.
+/// Vehicle 0 is the legacy single receiver.
+#[derive(Resource, Default)]
+pub struct VideoReceivers {
+    pub receivers: Vec<VideoReceiver>,
+}
+
+impl VideoReceivers {
+    pub fn get_mut(&mut self, vehicle: usize) -> Option<&mut VideoReceiver> {
+        self.receivers.get_mut(vehicle)
+    }
+    pub fn get(&self, vehicle: usize) -> Option<&VideoReceiver> {
+        self.receivers.get(vehicle)
+    }
+    pub fn len(&self) -> usize {
+        self.receivers.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.receivers.is_empty()
+    }
+}
+
+/// Per-vehicle stream stats. Index == `VehicleIndex`.
+#[derive(Resource, Default)]
+pub struct StreamStatsList {
+    pub stats: Vec<StreamStats>,
+}
+
+impl StreamStatsList {
+    pub fn get_mut(&mut self, vehicle: usize) -> Option<&mut StreamStats> {
+        self.stats.get_mut(vehicle)
+    }
+    pub fn get(&self, vehicle: usize) -> Option<&StreamStats> {
+        self.stats.get(vehicle)
+    }
+    pub fn primary(&self) -> Option<&StreamStats> {
+        self.stats.first()
+    }
 }
 
 impl Default for VideoReceiver {
@@ -230,6 +361,14 @@ impl VideoReceiver {
             profile,
             ..default()
         };
+    }
+
+    fn new_for_vehicle(vehicle: usize) -> Self {
+        // Distinct RNG seed per vehicle so link impairments differ.
+        let mut receiver = Self::default();
+        receiver.rng =
+            StdRng::seed_from_u64(0x56594445 ^ (vehicle as u64).wrapping_mul(0x9E3779B97F4A7C15));
+        receiver
     }
 
     fn enqueue(
@@ -403,38 +542,68 @@ impl VideoReceiver {
 pub fn setup_stream(
     mut commands: Commands,
     mut images: ResMut<Assets<Image>>,
-    source: Res<CameraFrameBuffer>,
+    buffers: Res<CameraFrameBuffers>,
     sensor: Res<SensorConfig>,
     mut output: ResMut<VideoOutput>,
 ) {
-    let pixels = vec![12; source.width as usize * source.height as usize * 4];
-    let mut image = Image::new_fill(
-        Extent3d {
-            width: source.width,
-            height: source.height,
-            depth_or_array_layers: 1,
-        },
-        TextureDimension::D2,
-        &[8, 14, 22, 255],
-        TextureFormat::Rgba8UnormSrgb,
-        RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
-    );
-    // Keep the CPU copy: only this receiver image is uploaded, never the source.
-    image.data = Some(pixels);
-    commands.insert_resource(StreamDisplay {
-        image: images.add(image),
-        width: source.width,
-        height: source.height,
-    });
-    match start_encoder(source.width, source.height, sensor.camera_fps) {
-        Ok(sender) => output.sender = Some(sender),
-        Err(error) => bevy::log::error!("FPV encoder is unavailable: {error}"),
+    let feed_count = buffers.len().max(1);
+    let width = buffers.buffers.first().map_or(640, |b| b.width);
+    let height = buffers.buffers.first().map_or(360, |b| b.height);
+    let mut displays = Vec::with_capacity(feed_count);
+    for feed in 0..feed_count {
+        let pixels = vec![12; width as usize * height as usize * 4];
+        let mut image = Image::new_fill(
+            Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            TextureDimension::D2,
+            &[8, 14, 22, 255],
+            TextureFormat::Rgba8UnormSrgb,
+            RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
+        );
+        // Keep the CPU copy: only this receiver image is uploaded, never the source.
+        image.data = Some(pixels);
+        displays.push(StreamDisplay {
+            image: images.add(image),
+            width,
+            height,
+        });
+        match start_encoder(width, height, sensor.camera_fps, feed) {
+            Ok(sender) => {
+                output.senders.push(Some(sender));
+                output.disconnected.push(false);
+            }
+            Err(error) => bevy::log::error!("FPV encoder {feed} is unavailable: {error}"),
+        }
     }
+    // Legacy single display mirrors vehicle 0.
+    if let Some(first) = displays.first() {
+        commands.insert_resource(StreamDisplay {
+            image: first.image.clone(),
+            width: first.width,
+            height: first.height,
+        });
+    }
+    commands.insert_resource(StreamDisplays { displays });
+    commands.insert_resource(VideoReceivers {
+        receivers: (0..feed_count)
+            .map(VideoReceiver::new_for_vehicle)
+            .collect(),
+    });
+    commands.insert_resource(StreamStatsList {
+        stats: (0..feed_count).map(|_| StreamStats::default()).collect(),
+    });
 }
 
-fn start_encoder(width: u32, height: u32, fps: f32) -> io::Result<SyncSender<Vec<u8>>> {
-    let url = std::env::var("VYDE_VIDEO_OUTPUT")
-        .unwrap_or_else(|_| "udp://127.0.0.1:5600?pkt_size=1316".to_owned());
+fn start_encoder(
+    width: u32,
+    height: u32,
+    fps: f32,
+    feed: usize,
+) -> io::Result<SyncSender<Vec<u8>>> {
+    let url = video_output_url(feed);
     if !url.starts_with("udp://") && !url.starts_with("rtsp://") {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -542,23 +711,25 @@ pub fn capture_video(
     mut commands: Commands,
     time: Res<Time>,
     sensor: Res<SensorConfig>,
-    source: Res<CameraFrameBuffer>,
+    buffers: Res<CameraFrameBuffers>,
     config: Res<VideoLinkConfig>,
     generation: Res<ResetGeneration>,
-    mut receiver: ResMut<VideoReceiver>,
-    mut stats: ResMut<StreamStats>,
-    mut cameras: Query<&mut Camera, With<FrameCamera>>,
+    mut receivers: ResMut<VideoReceivers>,
+    mut stats_list: ResMut<StreamStatsList>,
+    mut cameras: Query<(&mut Camera, &FrameCamera)>,
     requests: Query<(Entity, &CaptureRequest)>,
 ) {
     let now = time.elapsed_secs_f64();
-    if generation.0 != receiver.generation || config.profile != receiver.profile {
-        receiver.reset(generation.0, config.profile);
-        *stats = StreamStats {
-            profile: config.profile,
-            ..default()
-        };
-        for (entity, _) in &requests {
-            commands.entity(entity).despawn();
+    // Reset any receiver whose generation/profile changed.
+    for (vehicle, receiver) in receivers.receivers.iter_mut().enumerate() {
+        if generation.0 != receiver.generation || config.profile != receiver.profile {
+            receiver.reset(generation.0, config.profile);
+            if let Some(stats) = stats_list.get_mut(vehicle) {
+                *stats = StreamStats {
+                    profile: config.profile,
+                    ..default()
+                };
+            }
         }
     }
     for (entity, request) in &requests {
@@ -566,27 +737,51 @@ pub fn capture_video(
             commands.entity(entity).despawn();
         }
     }
-    let due = now >= receiver.next_capture && requests.iter().count() < 3 && !cameras.is_empty();
-    for mut camera in &mut cameras {
-        camera.is_active = due;
+    // Group cameras by vehicle; each vehicle captures from its own buffer.
+    let pending_per_vehicle: std::collections::HashMap<usize, usize> = requests
+        .iter()
+        .map(|(_, r)| r.vehicle)
+        .fold(std::collections::HashMap::new(), |mut map, v| {
+            *map.entry(v).or_default() += 1;
+            map
+        });
+    let mut due_vehicles: Vec<usize> = Vec::new();
+    for (vehicle, receiver) in receivers.receivers.iter().enumerate() {
+        let pending = pending_per_vehicle.get(&vehicle).copied().unwrap_or(0);
+        if now >= receiver.next_capture && pending < 3 {
+            due_vehicles.push(vehicle);
+        }
     }
-    if !due {
+    for (mut camera, frame_camera) in &mut cameras {
+        camera.is_active = due_vehicles.contains(&frame_camera.vehicle);
+    }
+    if due_vehicles.is_empty() {
         return;
     }
-    receiver.next_capture = now + 1.0 / sensor.camera_fps.clamp(1.0, 60.0) as f64;
-    let sequence = receiver.sequence;
-    receiver.sequence = receiver.sequence.wrapping_add(1);
-    commands.spawn((
-        ReadbackOnce::texture(source.image.clone()),
-        CaptureRequest {
-            captured_at: now,
-            sequence,
-            epoch: receiver.epoch,
-            generation: generation.0,
-            width: source.width,
-            height: source.height,
-        },
-    ));
+    let interval = 1.0 / sensor.camera_fps.clamp(1.0, 60.0) as f64;
+    for vehicle in due_vehicles {
+        let Some(buffer) = buffers.get(vehicle) else {
+            continue;
+        };
+        let Some(receiver) = receivers.get_mut(vehicle) else {
+            continue;
+        };
+        receiver.next_capture = now + interval;
+        let sequence = receiver.sequence;
+        receiver.sequence = receiver.sequence.wrapping_add(1);
+        commands.spawn((
+            ReadbackOnce::texture(buffer.image.clone()),
+            CaptureRequest {
+                captured_at: now,
+                sequence,
+                epoch: receiver.epoch,
+                generation: generation.0,
+                width: buffer.width,
+                height: buffer.height,
+                vehicle,
+            },
+        ));
+    }
 }
 
 /// WGPU aligns each row to 256 bytes; strip padding instead of skewing the image.
@@ -611,19 +806,25 @@ pub fn receive_gpu_frame(
     time: Res<Time>,
     sensor: Res<SensorConfig>,
     config: Res<VideoLinkConfig>,
-    mut receiver: ResMut<VideoReceiver>,
-    mut stats: ResMut<StreamStats>,
+    mut receivers: ResMut<VideoReceivers>,
+    mut stats_list: ResMut<StreamStatsList>,
 ) {
     let Ok(request) = requests.get(event.entity) else {
         return;
     };
     commands.entity(event.entity).despawn();
+    let Some(receiver) = receivers.get_mut(request.vehicle) else {
+        return;
+    };
     if request.epoch != receiver.epoch
         || request.generation != generation.0
         || config.profile != receiver.profile
     {
         return;
     }
+    let Some(stats) = stats_list.get_mut(request.vehicle) else {
+        return;
+    };
     if let Some(pixels) = unpack_rgba(&event.data, request.width, request.height) {
         receiver.enqueue(
             pixels,
@@ -632,7 +833,7 @@ pub fn receive_gpu_frame(
             time.elapsed_secs_f64(),
             sensor.camera_fps.clamp(1.0, 60.0),
             &config,
-            &mut stats,
+            stats,
         );
     }
 }
@@ -675,72 +876,95 @@ fn interference_pixels(
 pub fn present_video(
     time: Res<Time>,
     config: Res<VideoLinkConfig>,
-    display: Res<StreamDisplay>,
-    drone: Query<&Transform, With<crate::aircraft::Aircraft>>,
-    mut receiver: ResMut<VideoReceiver>,
-    mut stats: ResMut<StreamStats>,
+    displays: Res<StreamDisplays>,
+    drone: Query<
+        (&Transform, Option<&crate::aircraft::VehicleIndex>),
+        With<crate::aircraft::Aircraft>,
+    >,
+    mut receivers: ResMut<VideoReceivers>,
+    mut stats_list: ResMut<StreamStatsList>,
     mut images: ResMut<Assets<Image>>,
     mut video_output: ResMut<VideoOutput>,
 ) {
     let now = time.elapsed_secs_f64();
-    stats.distance_m = drone
-        .iter()
-        .next()
-        .map_or(0.0, |tf| tf.translation.distance(config.ground_station));
-    let distance_loss = (stats.distance_m / config.range_m.max(1.0)).powi(2);
+    // Distance per vehicle for signal quality.
+    let mut distances: std::collections::HashMap<usize, f32> = std::collections::HashMap::new();
+    for (tf, vehicle_index) in &drone {
+        let vehicle = vehicle_index.map(|v| v.0).unwrap_or(0);
+        distances.insert(vehicle, tf.translation.distance(config.ground_station));
+    }
     let interference =
         config.interference.max(0.0) * (0.55 + 0.45 * (time.elapsed_secs() * 1.7).sin());
-    stats.signal_quality = if config.profile == VideoProfile::Lost {
-        0.0
-    } else {
-        (1.0 / (1.0 + distance_loss) - interference * 0.4).clamp(0.0, 1.0)
-    };
-    stats.rssi_dbm = -40.0 - (1.0 - stats.signal_quality) * 60.0;
-    stats.profile = config.profile;
-    receiver.advance(now, &config, &mut stats);
-    if now - receiver.last_paint < 1.0 / 30.0 {
-        return;
-    }
-    receiver.last_paint = now;
-    let mut pixels = receiver
-        .last_pixels
-        .clone()
-        .unwrap_or_else(|| vec![12; display.width as usize * display.height as usize * 4]);
-    let noise = if config.profile == VideoProfile::Clean {
-        0.0
-    } else {
-        (interference + (1.0 - stats.signal_quality) * 0.6).clamp(0.0, 1.0)
-    };
-    interference_pixels(
-        &mut pixels,
-        display.width as usize,
-        now,
-        noise,
-        stats.state == LinkState::Lost,
-        &mut receiver.rng,
-    );
-    // Always write opaque alpha, including startup and reset placeholders.
-    for pixel in pixels.chunks_exact_mut(4) {
-        pixel[3] = 255;
-    }
-    if let Some(sender) = &video_output.sender {
-        match sender.try_send(pixels.clone()) {
-            Ok(()) | Err(TrySendError::Full(_)) => {}
-            Err(TrySendError::Disconnected(_)) if !video_output.disconnected => {
-                bevy::log::error!("FPV encoder worker disconnected");
-                video_output.disconnected = true;
-            }
-            Err(TrySendError::Disconnected(_)) => {}
+    // Collect presented pixels per vehicle first to avoid borrow conflicts.
+    let mut presented: Vec<(usize, Vec<u8>)> = Vec::new();
+    for vehicle in 0..receivers.len() {
+        let Some(stats) = stats_list.get_mut(vehicle) else {
+            continue;
+        };
+        let Some(receiver) = receivers.get_mut(vehicle) else {
+            continue;
+        };
+        let display = displays.displays.get(vehicle);
+        let (width, height) = display.map_or((640, 360), |d| (d.width, d.height));
+        stats.distance_m = distances.get(&vehicle).copied().unwrap_or(0.0);
+        let distance_loss = (stats.distance_m / config.range_m.max(1.0)).powi(2);
+        stats.signal_quality = if config.profile == VideoProfile::Lost {
+            0.0
+        } else {
+            (1.0 / (1.0 + distance_loss) - interference * 0.4).clamp(0.0, 1.0)
+        };
+        stats.rssi_dbm = -40.0 - (1.0 - stats.signal_quality) * 60.0;
+        stats.profile = config.profile;
+        receiver.advance(now, &config, stats);
+        if now - receiver.last_paint < 1.0 / 30.0 {
+            continue;
         }
+        receiver.last_paint = now;
+        let mut pixels = receiver
+            .last_pixels
+            .clone()
+            .unwrap_or_else(|| vec![12; width as usize * height as usize * 4]);
+        let noise = if config.profile == VideoProfile::Clean {
+            0.0
+        } else {
+            (interference + (1.0 - stats.signal_quality) * 0.6).clamp(0.0, 1.0)
+        };
+        interference_pixels(
+            &mut pixels,
+            width as usize,
+            now,
+            noise,
+            stats.state == LinkState::Lost,
+            &mut receiver.rng,
+        );
+        // Always write opaque alpha, including startup and reset placeholders.
+        for pixel in pixels.chunks_exact_mut(4) {
+            pixel[3] = 255;
+        }
+        presented.push((vehicle, pixels));
     }
-    if let Some(mut image) = images.get_mut(&display.image) {
-        image.data = Some(pixels);
+    for (vehicle, pixels) in presented {
+        video_output.try_send(vehicle, pixels.clone());
+        if let Some(display) = displays.displays.get(vehicle) {
+            if let Some(mut image) = images.get_mut(&display.image) {
+                image.data = Some(pixels);
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn video_profile_names_parse_case_insensitively() {
+        assert_eq!(VideoProfile::from_name("clean"), Some(VideoProfile::Clean));
+        assert_eq!(VideoProfile::from_name("CLEAN"), Some(VideoProfile::Clean));
+        assert_eq!(VideoProfile::from_name("Poor"), Some(VideoProfile::Poor));
+        assert_eq!(VideoProfile::from_name("lost"), Some(VideoProfile::Lost));
+        assert_eq!(VideoProfile::from_name("otro"), None);
+    }
 
     #[test]
     fn video_hotkey_cycles_the_link_profile_used_by_the_encoded_feed() {

@@ -57,10 +57,6 @@ pub fn apply_domain_randomization(
 pub fn reset_aircraft_system(
     mut reset: ResMut<ResetRequest>,
     mut generation: ResMut<ResetGeneration>,
-    mut rpms: ResMut<crate::motor_rpms::MotorRPMs>,
-    mut telemetry: ResMut<crate::sensors::Telemetry>,
-    mut mavlink: ResMut<crate::mavlink::MavlinkInterface>,
-    mut prev_velocity: ResMut<crate::sensors::PrevVelocity>,
     mut query: Query<
         (
             &mut Transform,
@@ -73,6 +69,10 @@ pub fn reset_aircraft_system(
             Option<&mut CollidingEntities>,
             Option<&mut crate::aircraft::Propulsion>,
             Option<&mut crate::aircraft::AircraftControls>,
+            Option<&mut crate::motor_rpms::MotorRPMs>,
+            Option<&mut crate::sensors::Telemetry>,
+            Option<&mut crate::mavlink::MavlinkInterface>,
+            Option<&mut crate::sensors::PrevVelocity>,
         ),
         With<crate::aircraft::Aircraft>,
     >,
@@ -91,6 +91,10 @@ pub fn reset_aircraft_system(
         contacts,
         propulsion,
         controls,
+        rpms,
+        telemetry,
+        mavlink,
+        prev_velocity,
     ) in &mut query
     {
         *tf = Transform::from_xyz(0.0, 2.0, 0.0);
@@ -116,18 +120,26 @@ pub fn reset_aircraft_system(
             controls.propulsion.fill(0.0);
             controls.surfaces.fill(0.0);
         }
+        if let Some(mut rpms) = rpms {
+            *rpms = crate::motor_rpms::MotorRPMs::default();
+        }
+        if let Some(mut telemetry) = telemetry {
+            *telemetry = crate::sensors::Telemetry {
+                position: Vec3::new(0.0, 2.0, 0.0),
+                rotation: Quat::IDENTITY,
+                ..default()
+            };
+        }
+        if let Some(mut mavlink) = mavlink {
+            mavlink.armed = false;
+            mavlink.external_control = false;
+            mavlink.guided_target = None;
+            mavlink.last_velocity_setpoint_secs = None;
+        }
+        if let Some(mut prev_velocity) = prev_velocity {
+            prev_velocity.0 = Vec3::ZERO;
+        }
     }
-    *rpms = crate::motor_rpms::MotorRPMs::default();
-    mavlink.armed = false;
-    mavlink.external_control = false;
-    mavlink.guided_target = None;
-    mavlink.last_velocity_setpoint_secs = None;
-    *telemetry = crate::sensors::Telemetry {
-        position: Vec3::new(0.0, 2.0, 0.0),
-        rotation: Quat::IDENTITY,
-        ..default()
-    };
-    prev_velocity.0 = Vec3::ZERO;
     generation.0 = generation.0.wrapping_add(1);
     reset.0 = false;
 }

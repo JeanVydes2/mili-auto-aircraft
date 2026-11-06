@@ -4,5 +4,11 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-crossterm = "0.29"
+axum = "0.8"
+bytes = "1"
+futures-util = "0.3"
+webrtc = "0.8"
+webrtc-media = "0.6.1"
 mavlink = { version = "0.21", default-features = false, features = ["std", "transport-udp", "dialect-common"] }
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "sync"] }

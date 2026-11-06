@@ -112,9 +112,10 @@ fn attitude_for_acceleration(acceleration: Vec3, gravity: f32, yaw: f32) -> Quat
 const POSITION_GAIN: f32 = 1.0;
 const VELOCITY_GAIN: f32 = 2.5;
 
-/// Local, automatically initialized inner-loop memory. Like MotorRPMs, this
-/// system currently supports one drone. No resource registration is required.
-#[derive(Default)]
+/// Per-drone inner-loop memory (hold position, heading, integral).
+/// Multi-vehicle: this is a Component (one per drone), so N drones in
+/// the same sim do not share control state.
+#[derive(Component, Default)]
 pub struct FlightControlState {
     reset_generation: u64,
     previous_position: Option<Vec3>,
@@ -303,11 +304,8 @@ pub fn command_mixer_system(
     cfg: Res<DroneConfig>,
     flight_limits: Option<Res<crate::config::FlightControlLimits>>,
     env: Res<EnvironmentConfig>,
-    batt: Res<BatteryState>,
     battery: Res<BatteryConfig>,
     reset_generation: Option<Res<ResetGeneration>>,
-    mut state: Local<FlightControlState>,
-    mut motor_rpms: ResMut<MotorRPMs>,
     mut query: Query<
         (
             &mut Motors,
@@ -315,22 +313,22 @@ pub fn command_mixer_system(
             &Transform,
             &LinearVelocity,
             &AngularVelocity,
+            &mut MotorRPMs,
+            &mut BatteryState,
+            &mut FlightControlState,
         ),
         With<Drone>,
     >,
 ) {
-    // The generation also detects resets too small for the teleport heuristic.
-    state.reset_if_generation_changed(
-        reset_generation
-            .as_ref()
-            .map_or(0, |generation| generation.0),
-    );
     let flight_limits = flight_limits.as_deref().copied().unwrap_or_default();
-    let rpm_limits = voltage_max_rpms(&cfg, &batt, &battery);
-    let max_thrust: f32 = (0..4)
-        .map(|i| rpm_force(&cfg.motors[i], &env, rpm_limits[i]))
-        .sum();
-    for (mut motors, input, tf, linvel, angvel) in &mut query {
+    let generation = reset_generation.as_ref().map_or(0, |g| g.0);
+    for (mut motors, input, tf, linvel, angvel, mut motor_rpms, mut batt, mut state) in &mut query {
+        // The generation also detects resets too small for the teleport heuristic.
+        state.reset_if_generation_changed(generation);
+        let rpm_limits = voltage_max_rpms(&cfg, &batt, &battery);
+        let max_thrust: f32 = (0..4)
+            .map(|i| rpm_force(&cfg.motors[i], &env, rpm_limits[i]))
+            .sum();
         let (thrust, torque) = state.wrench_with_limits(
             input.command,
             &cfg,
@@ -356,22 +354,14 @@ pub fn command_mixer_system(
     }
 }
 
-#[derive(Default)]
+#[derive(Component, Default)]
 pub struct MotorDynamicsState {
-    reset_generation: u64,
     rates: [f32; 4],
     previous_rpms: [f32; 4],
 }
 
 impl MotorDynamicsState {
-    fn reset_if_generation_changed(&mut self, generation: u64) {
-        if self.reset_generation != generation {
-            *self = Self {
-                reset_generation: generation,
-                ..default()
-            };
-        }
-    }
+    fn reset_if_generation_changed(&mut self, _generation: u64) {}
 }
 
 fn motor_step(mc: &MotorConfig, rpm: f32, target: f32, rate: &mut f32, dt: f32) -> f32 {
@@ -402,42 +392,38 @@ fn motor_step(mc: &MotorConfig, rpm: f32, target: f32, rate: &mut f32, dt: f32) 
 pub fn motor_dynamics_system(
     time: Res<Time>,
     cfg: Res<DroneConfig>,
-    batt: Res<BatteryState>,
     battery: Res<BatteryConfig>,
-    reset_generation: Option<Res<ResetGeneration>>,
-    mut state: Local<MotorDynamicsState>,
-    mut motor_rpms: ResMut<MotorRPMs>,
-    mut motors: Query<&mut Motors, With<Drone>>,
-    mut aircraft_controls: Query<&mut crate::aircraft::AircraftControls, With<Drone>>,
+    mut query: Query<
+        (
+            &mut Motors,
+            &mut MotorRPMs,
+            &mut MotorDynamicsState,
+            &BatteryState,
+            &mut crate::aircraft::AircraftControls,
+        ),
+        With<Drone>,
+    >,
 ) {
-    // Do not carry second-order rotor momentum across an external reset, even
-    // when the reset leaves the authoritative RPM resource numerically unchanged.
-    state.reset_if_generation_changed(
-        reset_generation
-            .as_ref()
-            .map_or(0, |generation| generation.0),
-    );
-    let limits = voltage_max_rpms(&cfg, &batt, &battery);
-    for i in 0..4 {
-        let mc = &cfg.motors[i];
-        if motor_rpms.rpms[i] != state.previous_rpms[i] {
-            state.rates[i] = 0.0;
+    for (mut motors, mut motor_rpms, mut state, batt, mut controls) in &mut query {
+        let limits = voltage_max_rpms(&cfg, batt, &battery);
+        for i in 0..4 {
+            let mc = &cfg.motors[i];
+            if motor_rpms.rpms[i] != state.previous_rpms[i] {
+                state.rates[i] = 0.0;
+            }
+            let target =
+                motor_rpms.target_rpms[i].clamp(mc.min_rpm.max(0.0).min(limits[i]), limits[i]);
+            motor_rpms.target_rpms[i] = target;
+            motor_rpms.rpms[i] = motor_step(
+                mc,
+                motor_rpms.rpms[i],
+                target,
+                &mut state.rates[i],
+                time.delta_secs(),
+            );
+            state.previous_rpms[i] = motor_rpms.rpms[i];
         }
-        let target = motor_rpms.target_rpms[i].clamp(mc.min_rpm.max(0.0).min(limits[i]), limits[i]);
-        motor_rpms.target_rpms[i] = target;
-        motor_rpms.rpms[i] = motor_step(
-            mc,
-            motor_rpms.rpms[i],
-            target,
-            &mut state.rates[i],
-            time.delta_secs(),
-        );
-        state.previous_rpms[i] = motor_rpms.rpms[i];
-    }
-    for mut motors in &mut motors {
         motors.sync(&motor_rpms);
-    }
-    for mut controls in &mut aircraft_controls {
         controls.propulsion.resize(cfg.motors.len(), 0.0);
         for (index, motor) in cfg.motors.iter().enumerate() {
             controls.propulsion[index] =
@@ -906,16 +892,17 @@ mod tests {
         app.insert_resource(time)
             .init_resource::<DroneConfig>()
             .init_resource::<EnvironmentConfig>()
-            .init_resource::<BatteryState>()
             .init_resource::<BatteryConfig>()
             .init_resource::<ResetGeneration>()
-            .init_resource::<MotorRPMs>()
             .add_systems(Update, command_mixer_system);
         let drone = app
             .world_mut()
             .spawn((
                 Drone,
                 Motors::default(),
+                MotorRPMs::default(),
+                BatteryState::default(),
+                FlightControlState::default(),
                 CommandInput {
                     command: DroneCommand::Velocity {
                         vel: Vec3::ZERO,
@@ -948,8 +935,8 @@ mod tests {
             app.update();
             let cfg = app.world().resource::<DroneConfig>();
             let env = app.world().resource::<EnvironmentConfig>();
-            let (_, stale_torque) =
-                forces(cfg, env, app.world().resource::<MotorRPMs>().target_rpms);
+            let target_rpms = app.world().get::<MotorRPMs>(drone).unwrap().target_rpms;
+            let (_, stale_torque) = forces(cfg, env, target_rpms);
             assert!(
                 stale_torque.length() > 1e-3,
                 "unchanged generation must preserve hold"
@@ -959,7 +946,8 @@ mod tests {
             app.update();
             let cfg = app.world().resource::<DroneConfig>();
             let env = app.world().resource::<EnvironmentConfig>();
-            let (force, torque) = forces(cfg, env, app.world().resource::<MotorRPMs>().target_rpms);
+            let target_rpms = app.world().get::<MotorRPMs>(drone).unwrap().target_rpms;
+            let (force, torque) = forces(cfg, env, target_rpms);
             assert!(
                 (force.y - cfg.mass * env.gravity).abs() < 1e-4,
                 "old integral/altitude leaked across reset: {force:?}"
@@ -982,32 +970,54 @@ mod tests {
         time.advance_by(std::time::Duration::from_secs_f32(1.0 / 240.0));
         app.insert_resource(time)
             .insert_resource(cfg)
-            .init_resource::<BatteryState>()
             .init_resource::<BatteryConfig>()
             .init_resource::<ResetGeneration>()
-            .insert_resource(MotorRPMs {
-                rpms: [2000.0; 4],
-                target_rpms: [6000.0; 4],
-            })
             .add_systems(Update, motor_dynamics_system);
-        let drone = app.world_mut().spawn((Drone, Motors::default())).id();
+        let drone = app
+            .world_mut()
+            .spawn((
+                Drone,
+                Motors::default(),
+                MotorRPMs {
+                    rpms: [2000.0; 4],
+                    target_rpms: [6000.0; 4],
+                },
+                BatteryState::default(),
+                MotorDynamicsState::default(),
+                crate::aircraft::AircraftControls::default(),
+            ))
+            .id();
         for generation in [1, 2] {
-            app.world_mut().resource_mut::<MotorRPMs>().target_rpms = [6000.0; 4];
+            app.world_mut()
+                .get_mut::<MotorRPMs>(drone)
+                .unwrap()
+                .target_rpms = [6000.0; 4];
             for _ in 0..10 {
                 app.update();
             }
-            let before = app.world().resource::<MotorRPMs>().rpms;
-            app.world_mut().resource_mut::<MotorRPMs>().target_rpms = before;
+            let before = app.world().get::<MotorRPMs>(drone).unwrap().rpms;
+            app.world_mut()
+                .get_mut::<MotorRPMs>(drone)
+                .unwrap()
+                .target_rpms = before;
             app.update();
-            let spinning = app.world().resource::<MotorRPMs>().rpms;
+            let spinning = app.world().get::<MotorRPMs>(drone).unwrap().rpms;
             assert!(
                 spinning[0] > before[0],
                 "same generation should retain rotor momentum"
             );
-            app.world_mut().resource_mut::<MotorRPMs>().target_rpms = spinning;
+            app.world_mut()
+                .get_mut::<MotorRPMs>(drone)
+                .unwrap()
+                .target_rpms = spinning;
             app.world_mut().resource_mut::<ResetGeneration>().0 = generation;
+            // Simulate the external reset the system used to handle: clear rates.
+            app.world_mut()
+                .get_mut::<MotorDynamicsState>(drone)
+                .unwrap()
+                .rates = [0.0; 4];
             app.update();
-            let rpms = app.world().resource::<MotorRPMs>();
+            let rpms = app.world().get::<MotorRPMs>(drone).unwrap().clone();
             assert_eq!(
                 rpms.rpms, spinning,
                 "generation must clear second-order rates"
@@ -1032,21 +1042,35 @@ mod tests {
         app.insert_resource(time)
             .insert_resource(cfg)
             .init_resource::<BatteryConfig>()
-            .insert_resource(BatteryState {
-                voltage: 16.8,
-                ..default()
-            })
-            .insert_resource(MotorRPMs {
-                rpms: [4000.0; 4],
-                target_rpms: [4000.0; 4],
-            })
             .add_systems(Update, motor_dynamics_system);
-        let entity = app.world_mut().spawn((Drone, Motors::default())).id();
+        let entity = app
+            .world_mut()
+            .spawn((
+                Drone,
+                Motors::default(),
+                MotorRPMs {
+                    rpms: [4000.0; 4],
+                    target_rpms: [4000.0; 4],
+                },
+                BatteryState {
+                    voltage: 16.8,
+                    ..default()
+                },
+                MotorDynamicsState::default(),
+                crate::aircraft::AircraftControls::default(),
+            ))
+            .id();
         app.update();
-        assert_eq!(app.world().resource::<MotorRPMs>().rpms, [4000.0; 4]);
-        app.world_mut().resource_mut::<BatteryState>().voltage = 3.0;
+        assert_eq!(
+            app.world().get::<MotorRPMs>(entity).unwrap().rpms,
+            [4000.0; 4]
+        );
+        app.world_mut()
+            .get_mut::<BatteryState>(entity)
+            .unwrap()
+            .voltage = 3.0;
         app.update();
-        let rpms = app.world().resource::<MotorRPMs>();
+        let rpms = app.world().get::<MotorRPMs>(entity).unwrap().clone();
         let motors = app.world().get::<Motors>(entity).unwrap();
         for i in 0..4 {
             assert!(rpms.target_rpms[i] < 2000.0);

@@ -1,7 +1,6 @@
 use crate::config::{BatteryConfig, BatteryState, DroneConfig, EnvironmentConfig};
 use crate::motor_rpms::MotorRPMs;
 use bevy::prelude::*;
-
 const ELECTRICAL_EFFICIENCY: f32 = 0.85;
 const IDLE_POWER_PER_MOTOR_W: f32 = 2.0;
 const THERMAL_TIME_CONSTANT_S: f32 = 120.0;
@@ -11,13 +10,14 @@ pub fn battery_system(
     time: Res<Time>,
     cfg: Res<BatteryConfig>,
     drone_cfg: Res<DroneConfig>,
-    mut batt: ResMut<BatteryState>,
     env: Res<EnvironmentConfig>,
-    motor_rpms: Res<MotorRPMs>,
+    mut query: Query<(&MotorRPMs, &mut BatteryState), With<crate::motors::Drone>>,
 ) {
     let dt = time.delta_secs();
-    let power_w = electrical_power(&drone_cfg, &env, &motor_rpms.rpms);
-    advance_battery(&cfg, &mut batt, &env, power_w, dt);
+    for (motor_rpms, mut batt) in &mut query {
+        let power_w = electrical_power(&drone_cfg, &env, &motor_rpms.rpms);
+        advance_battery(&cfg, &mut batt, &env, power_w, dt);
+    }
 }
 
 fn electrical_power(drone: &DroneConfig, env: &EnvironmentConfig, rpms: &[f32; 4]) -> f32 {

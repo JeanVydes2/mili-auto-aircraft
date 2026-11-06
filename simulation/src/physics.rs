@@ -1,5 +1,6 @@
 use crate::config::{DroneConfig, EnvironmentConfig};
 use crate::motors::Drone;
+use crate::sensors::{PrevVelocity, Telemetry};
 use avian3d::prelude::*;
 use bevy::prelude::*;
 
@@ -17,7 +18,7 @@ pub fn spawn_quad(
     cfg: &DroneConfig,
     position: Vec3,
     collider_half_extents: Vec3,
-) {
+) -> Entity {
     let entity = commands
         .spawn((
             Drone,
@@ -40,6 +41,14 @@ pub fn spawn_quad(
             GlobalTransform::default(),
             Visibility::default(),
         ))
+        .insert((
+            crate::motors::FlightControlState::default(),
+            crate::motors::MotorDynamicsState::default(),
+            crate::motor_rpms::MotorRPMs::default(),
+            crate::config::BatteryState::default(),
+            Telemetry::default(),
+            PrevVelocity::default(),
+        ))
         .id();
     let (airframe, propulsion) = crate::aircraft::from_quad_config(cfg);
     commands.entity(entity).insert((
@@ -53,6 +62,7 @@ pub fn spawn_quad(
             ..default()
         },
     ));
+    entity
 }
 
 pub fn setup_gravity(mut gravity: ResMut<Gravity>, env: Res<EnvironmentConfig>) {

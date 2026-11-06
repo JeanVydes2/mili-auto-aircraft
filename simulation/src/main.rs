@@ -13,12 +13,13 @@ mod sensors;
 mod stream;
 mod telemetry_log;
 mod visuals;
+mod visual_settings;
 
 use avian3d::prelude::*;
 use bevy::prelude::*;
 use config::*;
 
-use sensors::{PrevVelocity, Telemetry};
+use mavlink::SharedMavlink as _SharedMavlink;
 
 fn main() {
     let headless = std::env::var("HEADLESS").map(|v| v == "1").unwrap_or(false);
@@ -41,30 +42,31 @@ fn build_app(headless: bool) -> App {
         .insert_resource(environment::CurrentWind::default())
         .insert_resource(environment::Explosion::default())
         .insert_resource(BatteryConfig::default())
-        .insert_resource(BatteryState::default())
         .insert_resource(SensorConfig::default())
         .insert_resource(DomainRandomizationConfig::default())
         .insert_resource(CameraConfig::default())
-        .insert_resource(Telemetry::default())
-        .insert_resource(PrevVelocity(Vec3::ZERO))
         .insert_resource(mavlink::MavlinkConfig::default())
-        .insert_resource(mavlink::MavlinkInterface::default())
         .insert_resource(domain_randomization::ResetRequest(false))
         .init_resource::<domain_randomization::ResetGeneration>()
         .insert_resource(camera::CameraMode::default())
         .insert_resource(camera::FreeCamActive::default())
         .insert_resource(config::GizmosEnabled::default())
-        .insert_resource(motor_rpms::MotorRPMs::default())
+        .insert_resource(config::GuidanceVisualsEnabled::default())
         .init_resource::<stream::VideoLinkConfig>()
-        .init_resource::<stream::VideoReceiver>()
-        .init_resource::<stream::StreamStats>()
+        .init_resource::<stream::VideoReceivers>()
+        .init_resource::<stream::StreamStatsList>()
         .init_resource::<stream::VideoOutput>()
-        .init_resource::<stream::ReceiverView>();
+        .init_resource::<stream::ReceiverView>()
+        .init_resource::<hud::HudCharts>()
+        .init_resource::<visual_settings::VisualSettingsState>()
+        .init_resource::<environment::WindSettings>()
+        .init_resource::<camera::CameraFrameBuffers>();
 
     if headless {
         app.add_plugins((MinimalPlugins, TransformPlugin));
         app.add_plugins(bevy::asset::AssetPlugin::default());
         app.add_plugins(bevy::input::InputPlugin::default());
+        app.add_plugins(bevy::log::LogPlugin::default());
         app.init_asset::<Mesh>();
         app.init_asset::<StandardMaterial>();
     } else {
@@ -96,10 +98,10 @@ fn build_app(headless: bool) -> App {
             physics::setup_gravity,
             setup_scene,
             environment::setup_environment,
+            mavlink::setup_mavlink,
         )
             .chain(),
     );
-    app.add_systems(Startup, mavlink::setup_mavlink);
 
     // Reset poses before Avian computes mass/transform data. Run the entire
     // control/actuator/force pipeline at a deterministic 240 Hz, not render FPS.
@@ -158,6 +160,7 @@ fn build_app(headless: bool) -> App {
                 camera::attach_fpv_camera,
                 stream::setup_stream,
                 hud::setup_hud,
+                visual_settings::setup_visual_settings,
             )
                 .chain()
                 .after(setup_scene)
@@ -177,6 +180,8 @@ fn build_app(headless: bool) -> App {
                 stream::video_controls,
                 stream::capture_video,
                 stream::present_video,
+                visual_settings::visual_settings_input,
+                visual_settings::apply_visual_settings,
                 hud::update_hud,
                 visuals::animate_visuals,
             )
@@ -186,7 +191,7 @@ fn build_app(headless: bool) -> App {
             Update,
             telemetry_log::draw_gizmos_system.after(hud::update_hud),
         );
-        app.add_systems(Update, environment::draw_explosion_system);
+        app.add_systems(Update, environment::animate_explosion_particles);
     }
 
     app.insert_resource(Time::<bevy::time::Fixed>::from_hz(240.0));
@@ -203,35 +208,83 @@ fn request_reset_system(
     }
 }
 
-fn setup_scene(
+pub fn setup_scene(
     mut commands: Commands,
     mut drone_cfg: ResMut<DroneConfig>,
     catalog: Res<aircraft::AircraftCatalog>,
 ) {
-    spawn_profile(&mut commands, &mut drone_cfg, catalog.selected());
+    // Multi-vehicle: MULTI_AIRCRAFT="quad,hex" or MULTI_COUNT=N spawns N drones.
+    let multi = std::env::var("MULTI_AIRCRAFT")
+        .ok()
+        .map(|s| {
+            s.split(',')
+                .map(|name| match name.trim().to_ascii_lowercase().as_str() {
+                    "hex" => aircraft::AircraftType::Hex,
+                    "fixed_wing" | "fixedwing" => aircraft::AircraftType::FixedWing,
+                    "vtol" => aircraft::AircraftType::Vtol,
+                    _ => aircraft::AircraftType::Quad,
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_else(|| {
+            let count = std::env::var("MULTI_COUNT")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(1);
+            (0..count).map(|_| catalog.selected_kind()).collect()
+        });
+    let count = multi.len().max(1);
+    for (i, kind) in multi.into_iter().enumerate() {
+        let profile = catalog.profile(kind);
+        let offset = spawn_position(kind, i);
+        let entity = spawn_profile_at(
+            &mut commands,
+            &mut drone_cfg,
+            &profile,
+            offset,
+        );
+        commands.entity(entity).insert(aircraft::VehicleIndex(i));
+    }
+    let _ = count;
+}
+
+fn spawn_position(kind: aircraft::AircraftType, index: usize) -> Vec3 {
+    if kind == aircraft::AircraftType::FixedWing {
+        return Vec3::new(-28.0, 0.28, -22.0 + index as f32 * 4.0);
+    }
+    Vec3::new(
+        (index as f32 % 3.0) * 8.0 - 8.0,
+        2.0,
+        (index as f32 / 3.0) * 8.0,
+    )
 }
 
 fn spawn_profile(
     commands: &mut Commands,
     drone_cfg: &mut DroneConfig,
     profile: &aircraft::AircraftDefinition,
-) {
-    if profile.kind == aircraft::AircraftType::Quad {
+) -> Entity {
+    spawn_profile_at(commands, drone_cfg, profile, Vec3::new(0.0, 2.0, 0.0))
+}
+
+fn spawn_profile_at(
+    commands: &mut Commands,
+    drone_cfg: &mut DroneConfig,
+    profile: &aircraft::AircraftDefinition,
+    position: Vec3,
+) -> Entity {
+    let entity = if profile.kind == aircraft::AircraftType::Quad {
         drone_cfg.mass = profile.body.mass;
         drone_cfg.inertia = profile.body.inertia;
         drone_cfg.center_of_mass_offset = profile.body.center_of_mass;
         drone_cfg.linear_drag = profile.body.linear_drag;
         drone_cfg.induced_drag = profile.body.quadratic_drag.max_element();
         drone_cfg.angular_drag = profile.body.angular_drag;
-        physics::spawn_quad(
-            commands,
-            drone_cfg,
-            Vec3::new(0.0, 2.0, 0.0),
-            profile.collider_half_extents,
-        );
+        physics::spawn_quad(commands, drone_cfg, position, profile.collider_half_extents)
     } else {
-        profile.spawn(commands, Vec3::new(0.0, 2.0, 0.0));
-    }
+        profile.spawn(commands, position)
+    };
+    entity
 }
 
 fn select_aircraft_system(
@@ -239,7 +292,7 @@ fn select_aircraft_system(
     keyboard: Res<ButtonInput<KeyCode>>,
     mut catalog: ResMut<aircraft::AircraftCatalog>,
     mut drone_cfg: ResMut<DroneConfig>,
-    active: Query<Entity, With<aircraft::Aircraft>>,
+    active: Query<(Entity, Option<&aircraft::VehicleIndex>), With<aircraft::Aircraft>>,
 ) {
     let keys = [
         KeyCode::Digit1,
@@ -259,7 +312,7 @@ fn select_profile_button(
     mut commands: Commands,
     mut catalog: ResMut<aircraft::AircraftCatalog>,
     mut drone_cfg: ResMut<DroneConfig>,
-    active: Query<Entity, With<aircraft::Aircraft>>,
+    active: Query<(Entity, Option<&aircraft::VehicleIndex>), With<aircraft::Aircraft>>,
 ) {
     let Ok(button) = buttons.get(activate.entity) else {
         return;
@@ -277,17 +330,40 @@ fn select_profile(
     commands: &mut Commands,
     catalog: &mut aircraft::AircraftCatalog,
     drone_cfg: &mut DroneConfig,
-    active: &Query<Entity, With<aircraft::Aircraft>>,
+    active: &Query<(Entity, Option<&aircraft::VehicleIndex>), With<aircraft::Aircraft>>,
     index: usize,
 ) {
     if index >= catalog.definitions.len() || index == catalog.selected {
         return;
     }
     catalog.selected = index;
-    for entity in active.iter() {
+    // Preserve indices across despawn/respawn so MAVLink system_id, FPV
+    // buffers and video feeds stay mapped to the same vehicle slot.
+    let mut indices: Vec<usize> = active
+        .iter()
+        .map(|(_, idx)| idx.map(|v| v.0).unwrap_or(0))
+        .collect();
+    indices.sort_unstable();
+    indices.dedup();
+    if indices.is_empty() {
+        indices.push(0);
+    }
+    for (entity, _) in active.iter() {
         commands.entity(entity).despawn();
     }
-    spawn_profile(commands, drone_cfg, &catalog.definitions[catalog.selected]);
+    for (slot, vehicle_index) in indices.into_iter().enumerate() {
+        let kind = catalog.definitions[catalog.selected].kind;
+        let entity = spawn_profile_at(
+            commands,
+            drone_cfg,
+            &catalog.definitions[catalog.selected],
+            spawn_position(kind, vehicle_index),
+        );
+        commands
+            .entity(entity)
+            .insert(aircraft::VehicleIndex(vehicle_index));
+        let _ = slot;
+    }
 }
 
 #[cfg(test)]
@@ -319,13 +395,15 @@ mod graphics_tests {
 
     fn smoke_step(
         mut commands: Commands,
-        stats: Res<stream::StreamStats>,
+        stats_list: Res<stream::StreamStatsList>,
         mut mode: ResMut<camera::CameraMode>,
         mut view: ResMut<stream::ReceiverView>,
         mut link: ResMut<stream::VideoLinkConfig>,
         mut progress: Local<SmokeProgress>,
         mut exit: MessageWriter<bevy::app::AppExit>,
     ) {
+        let fallback = stream::StreamStats::default();
+        let stats = stats_list.primary().unwrap_or(&fallback);
         progress.first_rx |= stats.received_frames >= 3;
         assert!(
             progress.started.elapsed().as_secs() < 50,
@@ -448,6 +526,26 @@ mod flight_tests {
         assert_eq!(reply, 5.0);
     }
 
+    fn telemetry_of(app: &mut App) -> sensors::Telemetry {
+        let world = app.world_mut();
+        world
+            .query::<&sensors::Telemetry>()
+            .iter(world)
+            .next()
+            .cloned()
+            .unwrap_or_default()
+    }
+    fn set_interface(app: &mut App, index: usize, f: impl FnOnce(&mut mavlink::MavlinkInterface)) {
+        let world = app.world_mut();
+        let mut q = world.query::<&mut mavlink::MavlinkInterface>();
+        for (i, mut interface) in q.iter_mut(world).enumerate() {
+            if i == index {
+                f(&mut interface);
+                break;
+            }
+        }
+    }
+
     fn flight_app(env: EnvironmentConfig) -> App {
         flight_app_for_drone(env, DroneConfig::default())
     }
@@ -462,15 +560,14 @@ mod flight_tests {
         app.finish();
         app.cleanup();
         app.update();
-        {
-            let mut interface = app.world_mut().resource_mut::<mavlink::MavlinkInterface>();
+        set_interface(&mut app, 0, |interface| {
             interface.armed = true;
             interface.external_control = true;
             interface.guided_target = Some(mavlink::GuidedTarget::Position {
                 position: Vec3::Y * 2.0,
                 yaw: Some(0.0),
             });
-        }
+        });
         app
     }
 
@@ -486,7 +583,7 @@ mod flight_tests {
     fn step(app: &mut App, ticks: usize) {
         for _ in 0..ticks {
             app.update();
-            let telemetry = app.world().resource::<Telemetry>();
+            let telemetry = telemetry_of(&mut *app);
             assert!(telemetry.position.is_finite());
             assert!(telemetry.rotation.is_finite());
             assert!(telemetry.velocity.is_finite());
@@ -510,7 +607,7 @@ mod flight_tests {
             }
         }
         step(&mut app, 240 * 12);
-        let telemetry = app.world().resource::<Telemetry>();
+        let telemetry = telemetry_of(&mut app);
         assert!(
             (telemetry.position - Vec3::Y * 2.0).length() < 0.2,
             "{telemetry:?}"
@@ -534,7 +631,7 @@ mod flight_tests {
         };
         let mut app = flight_app_for_drone(EnvironmentConfig::default(), cfg);
         step(&mut app, 240 * 15);
-        let telemetry = app.world().resource::<Telemetry>();
+        let telemetry = telemetry_of(&mut app);
         assert!(
             (telemetry.position - Vec3::Y * 2.0).length() < 0.4,
             "{telemetry:?}"
@@ -552,7 +649,7 @@ mod flight_tests {
     fn actual_physics_rejects_gusts_under_mavlink_guidance() {
         let mut app = flight_app(EnvironmentConfig::default());
         step(&mut app, 240 * 15);
-        let telemetry = app.world().resource::<Telemetry>();
+        let telemetry = telemetry_of(&mut app);
         assert!(
             (telemetry.position - Vec3::Y * 2.0).length() < 0.4,
             "{telemetry:?}"
@@ -569,23 +666,23 @@ mod flight_tests {
     #[test]
     fn mavlink_position_setpoint_moves_then_holds_aircraft() {
         let mut app = flight_app(calm_air());
-        app.world_mut()
-            .resource_mut::<mavlink::MavlinkInterface>()
-            .guided_target = Some(mavlink::GuidedTarget::Position {
-            position: Vec3::new(0.0, 2.0, 5.0),
-            yaw: Some(0.0),
+        set_interface(&mut app, 0, |interface| {
+            interface.guided_target = Some(mavlink::GuidedTarget::Position {
+                position: Vec3::new(0.0, 2.0, 5.0),
+                yaw: Some(0.0),
+            });
         });
         step(&mut app, 240 * 2);
-        let stopped_position = app.world().resource::<Telemetry>().position;
+        let stopped_position = telemetry_of(&mut app).position;
         assert!(stopped_position.z > 2.0, "{stopped_position:?}");
-        app.world_mut()
-            .resource_mut::<mavlink::MavlinkInterface>()
-            .guided_target = Some(mavlink::GuidedTarget::Position {
-            position: stopped_position,
-            yaw: Some(0.0),
+        set_interface(&mut app, 0, |interface| {
+            interface.guided_target = Some(mavlink::GuidedTarget::Position {
+                position: stopped_position,
+                yaw: Some(0.0),
+            });
         });
         step(&mut app, 240 * 10);
-        let telemetry = app.world().resource::<Telemetry>();
+        let telemetry = telemetry_of(&mut app);
         assert!(
             (telemetry.position - stopped_position).length() < 0.4,
             "{telemetry:?}"
@@ -602,7 +699,7 @@ mod flight_tests {
                 Duration::from_secs_f64(1.0 / fps as f64),
             ));
             step(&mut app, fps * 10);
-            positions.push(app.world().resource::<Telemetry>().position);
+            positions.push(telemetry_of(&mut app).position);
         }
         for position in &positions[1..] {
             assert!((*position - positions[0]).length() < 0.02, "{positions:?}");
@@ -614,11 +711,16 @@ mod flight_tests {
         let mut app = flight_app(calm_air());
         {
             let world = app.world_mut();
-            let mut query =
-                world.query_filtered::<(&mut Transform, &mut Position), With<motors::Drone>>();
-            for (mut tf, mut position) in query.iter_mut(world) {
+            let mut query = world.query_filtered::<(
+                &mut Transform,
+                &mut Position,
+                &mut avian3d::prelude::LinearVelocity,
+            ), With<motors::Drone>>();
+            for (mut tf, mut position, mut velocity) in query.iter_mut(world) {
                 tf.translation = Vec3::new(0.0, 0.5, 2.0);
                 position.0 = tf.translation;
+                // High impact speed toward the cube: must explode.
+                velocity.0 = Vec3::new(0.0, -5.0, 0.0);
             }
         }
         for _ in 0..4 {
@@ -631,17 +733,17 @@ mod flight_tests {
             1
         );
         assert!(app.world().resource::<environment::Explosion>().active);
-        assert!((app.world().resource::<Telemetry>().position - Vec3::Y * 2.0).length() < 0.05);
+        assert!((telemetry_of(&mut app).position - Vec3::Y * 2.0).length() < 0.05);
     }
 
     #[test]
     fn unpowered_body_lands_on_ground_instead_of_falling_through() {
         let mut app = flight_app(calm_air());
-        app.world_mut()
-            .resource_mut::<mavlink::MavlinkInterface>()
-            .armed = false;
+        set_interface(&mut app, 0, |interface| {
+            interface.armed = false;
+        });
         step(&mut app, 240 * 3);
-        let telemetry = app.world().resource::<Telemetry>();
+        let telemetry = telemetry_of(&mut app);
         assert!(
             telemetry.position.y > 0.04 && telemetry.position.y < 0.08,
             "{telemetry:?}"
@@ -669,17 +771,17 @@ mod flight_tests {
                 .0,
             1
         );
-        let interface = app.world().resource::<mavlink::MavlinkInterface>();
-        assert!(!interface.armed);
-        assert!(interface.guided_target.is_none());
-        assert!(
-            app.world()
-                .resource::<motor_rpms::MotorRPMs>()
-                .rpms
-                .iter()
-                .all(|rpm| *rpm < 500.0)
-        );
+        {
+            let world = app.world_mut();
+            let mut q = world.query::<&mavlink::MavlinkInterface>();
+            let interface = q.iter(world).next().unwrap();
+            assert!(!interface.armed);
+            assert!(interface.guided_target.is_none());
+            let mut rq = world.query::<&motor_rpms::MotorRPMs>();
+            let rpms = rq.iter(world).next().unwrap();
+            assert!(rpms.rpms.iter().all(|rpm| *rpm < 500.0));
+        }
         step(&mut app, 240 * 5);
-        assert!(app.world().resource::<Telemetry>().position.y < 0.1);
+        assert!(telemetry_of(&mut app).position.y < 0.1);
     }
 }

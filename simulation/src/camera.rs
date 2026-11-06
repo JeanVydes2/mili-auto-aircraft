@@ -26,8 +26,31 @@ pub struct CameraFrameBuffer {
     pub height: u32,
 }
 
+/// Per-vehicle FPV frame buffers. Index == `VehicleIndex`, mirroring the
+/// MAVLink system_id and video feed numbering. Vehicle 0 keeps behavior
+/// identical to the legacy single `CameraFrameBuffer`.
+#[derive(Resource, Default)]
+pub struct CameraFrameBuffers {
+    pub buffers: Vec<CameraFrameBuffer>,
+}
+
+impl CameraFrameBuffers {
+    pub fn get(&self, index: usize) -> Option<&CameraFrameBuffer> {
+        self.buffers.get(index)
+    }
+    pub fn len(&self) -> usize {
+        self.buffers.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.buffers.is_empty()
+    }
+}
+
 #[derive(Component)]
-pub struct FrameCamera;
+pub struct FrameCamera {
+    /// Vehicle this offscreen camera belongs to (`VehicleIndex`).
+    pub vehicle: usize,
+}
 #[derive(Component)]
 pub struct FpvAttached;
 #[derive(Component)]
@@ -48,14 +71,33 @@ pub fn setup_cameras(
     }
     let width = sensor.camera_width.clamp(64, 1280);
     let height = sensor.camera_height.clamp(64, 720);
-    let mut source = Image::new_target_texture(width, height, TextureFormat::Rgba8UnormSrgb, None);
-    source.asset_usage = RenderAssetUsages::RENDER_WORLD;
-    source.texture_descriptor.usage |= TextureUsages::COPY_SRC;
-    commands.insert_resource(CameraFrameBuffer {
-        image: images.add(source),
-        width,
-        height,
-    });
+    let feed_count = std::env::var("MULTI_AIRCRAFT")
+        .ok()
+        .map(|s| s.split(',').filter(|n| !n.trim().is_empty()).count())
+        .or_else(|| {
+            std::env::var("MULTI_COUNT")
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok())
+        })
+        .unwrap_or(1)
+        .max(1);
+    let mut buffers = Vec::with_capacity(feed_count);
+    for _ in 0..feed_count {
+        let mut source =
+            Image::new_target_texture(width, height, TextureFormat::Rgba8UnormSrgb, None);
+        source.asset_usage = RenderAssetUsages::RENDER_WORLD;
+        source.texture_descriptor.usage |= TextureUsages::COPY_SRC;
+        buffers.push(CameraFrameBuffer {
+            image: images.add(source),
+            width,
+            height,
+        });
+    }
+    // Keep legacy single-buffer resource pointing at vehicle 0 for compat.
+    if let Some(first) = buffers.first() {
+        commands.insert_resource(first.clone());
+    }
+    commands.insert_resource(CameraFrameBuffers { buffers });
     commands.spawn((
         FreeCamera,
         ViewCamera(CameraMode::Free),
@@ -99,11 +141,18 @@ pub fn setup_cameras(
 
 pub fn attach_fpv_camera(
     mut commands: Commands,
-    drones: Query<Entity, (With<crate::aircraft::Aircraft>, Without<FpvAttached>)>,
-    buffer: Res<CameraFrameBuffer>,
+    drones: Query<
+        (Entity, Option<&crate::aircraft::VehicleIndex>),
+        (With<crate::aircraft::Aircraft>, Without<FpvAttached>),
+    >,
+    buffers: Res<CameraFrameBuffers>,
     sensor: Res<SensorConfig>,
 ) {
-    for drone in &drones {
+    for (drone, vehicle_index) in &drones {
+        let vehicle = vehicle_index.map(|v| v.0).unwrap_or(0);
+        let Some(buffer) = buffers.get(vehicle) else {
+            continue;
+        };
         commands
             .entity(drone)
             .insert(FpvAttached)
@@ -126,7 +175,7 @@ pub fn attach_fpv_camera(
                     fpv_transform(),
                 ));
                 parent.spawn((
-                    FrameCamera,
+                    FrameCamera { vehicle },
                     Camera3d::default(),
                     Msaa::Off,
                     Camera {

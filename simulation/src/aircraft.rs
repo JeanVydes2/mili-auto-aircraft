@@ -10,9 +10,17 @@ use serde::Deserialize;
 use std::path::PathBuf;
 
 use crate::environment::CurrentWind;
+use crate::sensors::{PrevVelocity, Telemetry};
 
 #[derive(Component)]
 pub struct Aircraft;
+
+/// Stable per-vehicle index (0-based) assigned at spawn time in `setup_scene`
+/// and preserved across respawns by `select_profile`. This drives MAVLink
+/// `system_id`, FPV camera buffers and video feeds, so vehicle N always maps
+/// to feed N regardless of Bevy query iteration order.
+#[derive(Component, Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct VehicleIndex(pub usize);
 
 #[derive(Component, Clone, Debug)]
 pub struct Airframe {
@@ -219,6 +227,18 @@ impl AircraftCatalog {
     pub fn selected(&self) -> &AircraftDefinition {
         &self.definitions[self.selected]
     }
+
+    pub fn selected_kind(&self) -> AircraftType {
+        self.selected().kind
+    }
+
+    pub fn profile(&self, kind: AircraftType) -> AircraftDefinition {
+        self.definitions
+            .iter()
+            .find(|d| d.kind == kind)
+            .cloned()
+            .unwrap_or_else(|| self.selected().clone())
+    }
 }
 
 impl AircraftDefinition {
@@ -330,6 +350,20 @@ impl AircraftDefinition {
     }
 
     pub fn spawn(&self, commands: &mut Commands, position: Vec3) -> Entity {
+        let propulsion_channels = self
+            .propulsion
+            .0
+            .iter()
+            .map(|propulsor| propulsor.control_channel + 1)
+            .max()
+            .unwrap_or_default();
+        let surface_channels = self
+            .surfaces
+            .0
+            .iter()
+            .filter_map(|surface| surface.control_channel.map(|channel| channel + 1))
+            .max()
+            .unwrap_or_default();
         commands
             .spawn((
                 Aircraft,
@@ -337,7 +371,10 @@ impl AircraftDefinition {
                 self.body.clone(),
                 self.propulsion.clone(),
                 self.surfaces.clone(),
-                AircraftControls::default(),
+                AircraftControls {
+                    propulsion: vec![0.0; propulsion_channels],
+                    surfaces: vec![0.0; surface_channels],
+                },
                 RigidBody::Dynamic,
                 Collider::cuboid(
                     self.collider_half_extents.x * 2.0,
@@ -356,6 +393,13 @@ impl AircraftDefinition {
                 Transform::from_translation(position),
                 GlobalTransform::default(),
                 Visibility::default(),
+                crate::motor_rpms::MotorRPMs::default(),
+                crate::config::BatteryState::default(),
+                Telemetry::default(),
+                PrevVelocity::default(),
+                crate::motors::FlightControlState::default(),
+                crate::motors::MotorDynamicsState::default(),
+                crate::motors::CommandInput::default(),
             ))
             .id()
     }
@@ -549,6 +593,18 @@ pub fn aircraft_wrench(
             velocity + angular_velocity.cross(surface.position - body.center_of_mass);
         let speed_squared = local_velocity.length_squared();
         if speed_squared < 1e-6 || surface.area <= 0.0 {
+            if speed_squared < 1e-6
+                && surface.control_channel.is_some()
+                && surface.lift_axis.x.abs() > surface.lift_axis.y.abs()
+            {
+                let command = surface
+                    .control_channel
+                    .and_then(|channel| controls.surfaces.get(channel))
+                    .copied()
+                    .unwrap_or(0.0)
+                    * surface.control_sign;
+                torque.y += command.clamp(-1.0, 1.0) * body.mass * 0.9;
+            }
             continue;
         }
         let speed = speed_squared.sqrt();
@@ -575,6 +631,21 @@ pub fn aircraft_wrench(
         let surface_force = drag + lift;
         force += surface_force;
         torque += (surface.position - body.center_of_mass).cross(surface_force);
+        // A parked fixed-wing aircraft still needs a bounded ground-steering
+        // moment. Aerodynamic rudder authority is zero at standstill, so use
+        // the rudder command as a low-speed nose-wheel/tailwheel surrogate.
+        if speed_squared < 16.0
+            && surface.control_channel.is_some()
+            && lift_axis.x.abs() > lift_axis.y.abs()
+        {
+            let command = surface
+                .control_channel
+                .and_then(|channel| controls.surfaces.get(channel))
+                .copied()
+                .unwrap_or(0.0)
+                * surface.control_sign;
+            torque.y += command.clamp(-1.0, 1.0) * body.mass * 0.9;
+        }
     }
 
     (force, torque)
@@ -732,6 +803,27 @@ mod tests {
             1.0,
         );
         assert_eq!(stationary, Vec3::ZERO);
+
+        let parked_controls = AircraftControls {
+            surfaces: vec![0.0, 0.0, 0.0, 1.0],
+            ..default()
+        };
+        let (_, parked_steering_torque) = aircraft_wrench(
+            &body,
+            &mut propulsion,
+            &surfaces,
+            &parked_controls,
+            Quat::IDENTITY,
+            Vec3::ZERO,
+            Vec3::ZERO,
+            Vec3::ZERO,
+            1.225,
+            1.0,
+        );
+        assert!(
+            parked_steering_torque.y.abs() > 0.1,
+            "rudder must provide bounded ground steering at rest"
+        );
 
         let (level, _) = aircraft_wrench(
             &body,

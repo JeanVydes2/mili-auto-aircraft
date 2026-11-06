@@ -1,4 +1,7 @@
-//! Ground control: received instruments and local engineering are deliberately separate.
+//! Military terminal HUD: monochrome (green-on-black), monospace, flat panels,
+//! no rounded corners, no gradients. Shows live telemetry as ASCII text plus
+//! real-time strip-chart histories (speed / altitude / battery) rendered as
+//! sparkline rows of bar characters.
 //!
 //! Register `setup_font` before HUD/visuals startup, `setup_hud` after camera/stream
 //! startup, then `update_hud` in Update. UiScale is global (0.9–1.0).
@@ -23,15 +26,23 @@ use crate::domain_randomization::ResetGeneration;
 use crate::environment::CurrentWind;
 use crate::motors::Drone;
 use crate::sensors::Telemetry;
-use crate::stream::{LinkState, ReceiverView, StreamDisplay, StreamStats};
+use crate::stream::{LinkState, ReceiverView, StreamDisplays, StreamStatsList};
 
-const CYAN: Color = Color::srgb(0.25, 0.91, 0.97);
-const AMBER: Color = Color::srgb(1.0, 0.73, 0.29);
-const RED: Color = Color::srgb(1.0, 0.32, 0.35);
-const INK: Color = Color::srgba(0.025, 0.045, 0.065, 0.91);
-const WHITE: Color = Color::srgb(0.89, 0.95, 0.97);
-const MUTED: Color = Color::srgb(0.59, 0.71, 0.76);
-const EDGE: Color = Color::srgba(0.25, 0.72, 0.80, 0.45);
+// Military terminal palette: single phosphor green on black, no gradients/flat colors.
+// Dim green = secondary values, bright green = primary, black = background/bars.
+const TERM_BG: Color = Color::BLACK;
+const TERM_PANEL: Color = Color::srgb(0.01, 0.06, 0.01);
+const TERM_FG: Color = Color::srgb(0.33, 1.0, 0.33); // phosphor green
+const TERM_DIM: Color = Color::srgb(0.14, 0.45, 0.14); // dim green
+const TERM_FAINT: Color = Color::srgb(0.06, 0.25, 0.06); // bar track
+const TERM_WARN: Color = Color::srgb(0.33, 1.0, 0.33); // same hue, used for status text
+const INK: Color = Color::srgb(0.005, 0.01, 0.015);
+const EDGE: Color = Color::srgb(0.12, 0.55, 0.65);
+const CYAN: Color = Color::srgb(0.25, 0.92, 1.0);
+const AMBER: Color = Color::srgb(1.0, 0.67, 0.18);
+const RED: Color = Color::srgb(1.0, 0.22, 0.18);
+const WHITE: Color = Color::srgb(0.86, 0.94, 0.96);
+const MUTED: Color = Color::srgb(0.38, 0.52, 0.58);
 
 #[derive(Component)]
 enum Element {
@@ -53,6 +64,7 @@ enum Element {
     FeedTitle,
     FeedCaption,
     SignalBar,
+    Charts,
     Help,
     Footer,
 }
@@ -64,6 +76,42 @@ pub struct HudState {
     home: Vec3,
     started_at: f64,
     generation: u64,
+}
+
+/// Real-time history ring buffers for the strip charts (10 Hz sampling).
+#[derive(Resource, Default)]
+pub struct HudCharts {
+    pub speed: std::collections::VecDeque<f32>,
+    pub altitude: std::collections::VecDeque<f32>,
+    pub battery: std::collections::VecDeque<f32>,
+}
+
+const CHART_CAPACITY: usize = 60; // 6 s at 10 Hz
+
+fn push_chart(history: &mut std::collections::VecDeque<f32>, value: f32) {
+    if value.is_finite() {
+        history.push_back(value);
+        while history.len() > CHART_CAPACITY {
+            history.pop_front();
+        }
+    }
+}
+
+/// Render a sparkline row: one bar char per sample, scaled 0..=max.
+fn sparkline(history: &std::collections::VecDeque<f32>, max: f32, width: usize) -> String {
+    const BARS: [char; 9] = [' ', '\u{2581}', '\u{2582}', '\u{2583}', '\u{2584}', '\u{2585}', '\u{2586}', '\u{2587}', '\u{2588}'];
+    let max = if max.is_finite() && max > 0.0 { max } else { 1.0 };
+    let take = width.min(history.len());
+    let samples: Vec<f32> = history.iter().rev().take(take).rev().copied().collect();
+    let pad = width.saturating_sub(samples.len());
+    let mut out = String::with_capacity(width);
+    out.push_str(&" ".repeat(pad));
+    for sample in samples {
+        let ratio = (sample / max).clamp(0.0, 1.0);
+        let idx = (ratio * (BARS.len() - 1) as f32).round() as usize;
+        out.push(BARS[idx]);
+    }
+    out
 }
 
 /// Local text clock; layout, input, image handles and attitude still update every frame.
@@ -85,20 +133,28 @@ impl Default for HudClock {
 }
 
 #[derive(SystemParam)]
-pub struct HudSources<'w> {
-    local: Res<'w, Telemetry>,
-    battery: Res<'w, BatteryState>,
+pub struct HudSources<'w, 's> {
     drone: Res<'w, DroneConfig>,
     environment: Res<'w, EnvironmentConfig>,
     flight_limits: Res<'w, FlightControlLimits>,
-
+    aircraft: Query<'w, 's, (&'static Telemetry, &'static BatteryState), With<Drone>>,
     wind: Option<Res<'w, CurrentWind>>,
     camera: Res<'w, CameraMode>,
     free_camera: Res<'w, FreeCamActive>,
-    display: Res<'w, StreamDisplay>,
-    stream: Res<'w, StreamStats>,
+    display: Res<'w, StreamDisplays>,
+    stream: Res<'w, StreamStatsList>,
     receiver: Res<'w, ReceiverView>,
     reset: Option<Res<'w, ResetGeneration>>,
+    charts: ResMut<'w, HudCharts>,
+}
+
+impl<'w, 's> HudSources<'w, 's> {
+    fn primary_display(&self) -> Option<&crate::stream::StreamDisplay> {
+        self.display.displays.first()
+    }
+    fn primary_stream(&self) -> Option<&crate::stream::StreamStats> {
+        self.stream.primary()
+    }
 }
 
 // One query avoids overlapping mutable Node/Text queries and their B0001 conflicts.
@@ -135,15 +191,15 @@ fn panel() -> impl Bundle {
     (
         Node {
             flex_direction: FlexDirection::Column,
-            padding: UiRect::all(px(12)),
-            row_gap: px(5),
+            padding: UiRect::all(px(10)),
+            row_gap: px(4),
             border: UiRect::all(px(1)),
-            border_radius: BorderRadius::all(px(7)),
+            border_radius: BorderRadius::all(px(0)),
             flex_shrink: 0.0,
             ..default()
         },
-        BackgroundColor(INK),
-        BorderColor::all(EDGE),
+        BackgroundColor(TERM_PANEL),
+        BorderColor::all(TERM_DIM),
     )
 }
 
@@ -199,10 +255,14 @@ pub fn setup_hud(
     commands.insert_resource(HudState {
         visible: true,
         help: false,
-        home: drone
-            .iter()
-            .next()
-            .map_or(sources.local.position, |tf| tf.translation),
+        home: drone.iter().next().map_or(
+            sources
+                .aircraft
+                .iter()
+                .next()
+                .map_or(Vec3::ZERO, |(t, _)| t.position),
+            |tf| tf.translation,
+        ),
         started_at: time.elapsed_secs_f64(),
         generation: sources.reset.as_ref().map_or(0, |r| r.0),
     });
@@ -214,8 +274,8 @@ pub fn setup_hud(
             root.spawn((
                 Element::Feed,
                 feed_node(sources.receiver.0),
-                BackgroundColor(Color::BLACK),
-                BorderColor::all(AMBER),
+                BackgroundColor(TERM_BG),
+                BorderColor::all(TERM_DIM),
             ))
             .with_children(|feed| {
                 feed.spawn((
@@ -225,7 +285,12 @@ pub fn setup_hud(
                         height: percent(100),
                         ..default()
                     },
-                    ImageNode::new(sources.display.image.clone()),
+                    ImageNode::new(
+                        sources
+                            .primary_display()
+                            .map(|d| d.image.clone())
+                            .unwrap_or_default(),
+                    ),
                 ));
                 feed.spawn((
                     Element::FeedTop,
@@ -242,7 +307,7 @@ pub fn setup_hud(
                     ZIndex(1),
                 ))
                 .with_children(|banner| {
-                    banner.spawn((Element::FeedTitle, text("RX DELAYED · BUFFER", 14.0, AMBER)));
+                    banner.spawn((Element::FeedTitle, text("RX DELAYED + BUFFER", 14.0, TERM_FG)));
                 });
                 feed.spawn((
                     Element::FeedBottom,
@@ -261,7 +326,7 @@ pub fn setup_hud(
                 .with_children(|banner| {
                     banner.spawn((
                         Element::FeedCaption,
-                        text("WAITING FOR RECEIVED FRAME", 12.0, WHITE),
+                        text("WAITING FOR RECEIVED FRAME", 12.0, TERM_FG),
                     ));
                 });
             });
@@ -288,11 +353,11 @@ pub fn setup_hud(
                     border: UiRect::bottom(px(2)),
                     ..default()
                 },
-                BackgroundColor(INK),
-                BorderColor::all(CYAN),
+                BackgroundColor(TERM_PANEL),
+                BorderColor::all(TERM_DIM),
             ))
             .with_children(|header| {
-                header.spawn(text("VYDE / FLIGHT CONTROL", 21.0, CYAN));
+                header.spawn(text("VYDE // FLIGHT CONTROL", 21.0, TERM_FG));
                 header
                     .spawn(Node {
                         align_items: AlignItems::Center,
@@ -300,7 +365,7 @@ pub fn setup_hud(
                         ..default()
                     })
                     .with_children(|controls| {
-                        controls.spawn((Element::ViewBadge, text("AIRFRAME", 12.0, MUTED)));
+                        controls.spawn((Element::ViewBadge, text("AIRFRAME", 12.0, TERM_DIM)));
                         for (index, label) in ["QUAD", "HEX", "FIXED WING", "VTOL"].into_iter().enumerate() {
                             controls
                                 .spawn((
@@ -309,14 +374,14 @@ pub fn setup_hud(
                                     Node {
                                         padding: UiRect::axes(px(10), px(6)),
                                         border: UiRect::all(px(1)),
-                                        border_radius: BorderRadius::all(px(4)),
+                                        border_radius: BorderRadius::all(px(0)),
                                         ..default()
                                     },
-                                    BackgroundColor(Color::srgb(0.08, 0.16, 0.19)),
-                                    BorderColor::all(EDGE),
+                                    BackgroundColor(TERM_PANEL),
+                                    BorderColor::all(TERM_DIM),
                                 ))
                                 .with_children(|button| {
-                                    button.spawn(text(label, 12.0, WHITE));
+                                    button.spawn(text(label, 12.0, TERM_FG));
                                 });
                         }
                     });
@@ -381,6 +446,24 @@ pub fn setup_hud(
                         });
                     }
                 });
+            });
+
+            root.spawn((
+                Element::Charts,
+                Node {
+                    position_type: PositionType::Absolute,
+                    left: px(20),
+                    bottom: px(108),
+                    width: px(310),
+                    padding: UiRect::all(px(10)),
+                    flex_direction: FlexDirection::Column,
+                    ..default()
+                },
+                BackgroundColor(TERM_PANEL),
+                BorderColor::all(EDGE),
+            ))
+            .with_children(|p| {
+                p.spawn((Element::Charts, text("TREND / 6 SEC", 13.0, CYAN)));
             });
 
             root.spawn((
@@ -556,7 +639,7 @@ pub fn update_hud(
     keyboard: Res<ButtonInput<KeyCode>>,
     mut gizmos: Option<ResMut<GizmosEnabled>>,
     state: Option<ResMut<HudState>>,
-    sources: HudSources,
+    mut sources: HudSources,
     mut widgets: HudWidgets,
     mut clock: Local<HudClock>,
     window: Query<&Window, With<PrimaryWindow>>,
@@ -588,16 +671,26 @@ pub fn update_hud(
         }
         refresh = true;
     }
+    let fallback_telemetry = Telemetry::default();
+    let fallback_battery = BatteryState::default();
+    let (rx, battery) = sources
+        .aircraft
+        .iter()
+        .next()
+        .map_or((&fallback_telemetry, &fallback_battery), |(t, b)| (t, b));
     if let Some(generation) = &sources.reset {
         if state.generation != generation.0 {
             state.generation = generation.0;
-            state.home = sources.local.position;
+            state.home = rx.position;
             state.started_at = time.elapsed_secs_f64();
             refresh = true;
         }
     }
-    let rx = &sources.local;
-    let stream = &sources.stream;
+    push_chart(&mut sources.charts.speed, horizontal_speed(rx.velocity));
+    push_chart(&mut sources.charts.altitude, rx.position.y.max(0.0));
+    push_chart(&mut sources.charts.battery, unit_percent(battery.soc));
+    let fallback_stream = crate::stream::StreamStats::default();
+    let stream = sources.primary_stream().unwrap_or(&fallback_stream);
     let fullscreen = sources.receiver.0;
     let (status, status_color) = link_status(stream.state);
     let (heading, pitch, roll) = attitude(rx.rotation);
@@ -641,8 +734,10 @@ pub fn update_hud(
             }
             Element::FeedImage => {
                 if let Some(mut image) = image {
-                    if image.image != sources.display.image {
-                        image.image = sources.display.image.clone();
+                    if let Some(display) = sources.primary_display() {
+                        if image.image != display.image {
+                            image.image = display.image.clone();
+                        }
                     }
                 }
             }
@@ -716,8 +811,8 @@ pub fn update_hud(
                 );
             }
             Element::Local => {
-                let t = &sources.local;
-                let b = &sources.battery;
+                let t = rx;
+                let b = battery;
                 let e = &sources.environment;
                 let wind = sources.wind.as_ref().map_or(e.wind_constant, |w| w.0);
                 let wind_source = if sources.wind.is_some() {
@@ -751,27 +846,21 @@ pub fn update_hud(
                 );
             }
             Element::MotorLabel(i) => {
-                set_text(
-                    label,
-                    format!("M{} {:6.0} RPM", i + 1, sources.local.motor_rpms[*i]),
-                );
+                set_text(label, format!("M{} {:6.0} RPM", i + 1, rx.motor_rpms[*i]));
             }
             Element::MotorBar(i) => {
-                let ratio = safe_ratio(
-                    sources.local.motor_rpms[*i],
-                    sources.drone.motors[*i].max_rpm,
-                );
+                let ratio = safe_ratio(rx.motor_rpms[*i], sources.drone.motors[*i].max_rpm);
                 node.width = percent(unit_percent(ratio));
                 if let Some(mut bg) = background {
                     bg.0 = if ratio >= 0.9 { AMBER } else { CYAN };
                 }
             }
             Element::BatteryBar => {
-                node.width = percent(unit_percent(sources.battery.soc));
+                node.width = percent(unit_percent(battery.soc));
                 if let Some(mut bg) = background {
-                    bg.0 = if sources.battery.soc <= 0.15 {
+                    bg.0 = if battery.soc <= 0.15 {
                         RED
-                    } else if sources.battery.soc <= 0.3 {
+                    } else if battery.soc <= 0.3 {
                         AMBER
                     } else {
                         CYAN
@@ -783,6 +872,18 @@ pub fn update_hud(
                 if let Some(mut bg) = background {
                     bg.0 = status_color;
                 }
+            }
+            Element::Charts => {
+                set_text(
+                    label,
+                    format!(
+                        "TREND / 6 SEC\nSPD {:>24}\nALT {:>24}\nBAT {:>24}",
+                        sparkline(&sources.charts.speed, 30.0, 24),
+                        sparkline(&sources.charts.altitude, 30.0, 24),
+                        sparkline(&sources.charts.battery, 100.0, 24),
+                    ),
+                );
+                set_color(color, CYAN);
             }
             Element::Link => {
                 set_text(
@@ -815,8 +916,8 @@ pub fn update_hud(
                         "{:.1} FPS / AGE {:.0} ms / {}×{} · TAB {}",
                         stream.rx_fps,
                         stream.frame_age_ms,
-                        sources.display.width,
-                        sources.display.height,
+                        sources.primary_display().map_or(640, |d| d.width),
+                        sources.primary_display().map_or(360, |d| d.height),
                         if fullscreen { "MONITOR" } else { "EXPAND" },
                     ),
                 );
@@ -826,7 +927,7 @@ pub fn update_hud(
                 set_text(
                     label,
                     format!(
-                        "MAVLink CONTROL: run `controller` · R reset · Ctrl+F free camera · C chase · TAB monitor · V video-link profile · G gizmos {} · F1 help · F3 HUD",
+                        "MAVLink CONTROL: run `controller` · R reset · Ctrl+F free camera · C chase · TAB monitor · V video-link profile · G gizmos {} · H nav grid/vector · F1 help · F3 HUD",
                         if gizmos { "ON" } else { "OFF" },
                     ),
                 );

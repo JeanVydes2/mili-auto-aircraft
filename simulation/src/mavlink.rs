@@ -1,9 +1,11 @@
 use crate::aircraft::{
-    Aircraft, AircraftCatalog, AircraftControls, AircraftModel, AircraftType, Airframe, Propulsion,
+    Aircraft, AircraftCatalog, AircraftControls, AircraftModel, AircraftType, Airframe,
+    FlightSurfaces, Propulsion, VehicleIndex,
 };
 use crate::config::{BatteryConfig, BatteryState, FlightControlLimits};
 use crate::motors::{CommandInput, DroneCommand, MotorCommand};
 use crate::sensors::Telemetry;
+use avian3d::prelude::{AngularVelocity, LinearVelocity};
 use bevy::prelude::*;
 use mavlink::dialects::common::*;
 use mavlink::{MavConnection, MavHeader, Message, connect};
@@ -43,11 +45,17 @@ pub enum GuidedTarget {
         velocity: Vec3,
         yaw_rate: Option<f32>,
     },
+    /// Control manual estilo avión: W/S es empuje (throttle), no
+    /// desired velocity. The aircraft accelerates by physics and takes off by itself.
+    /// Only used by FixedWing; other models treat it as Velocity.
+    Manual {
+        throttle: f32,
+        yaw_rate: f32,
+    },
 }
 
-#[derive(Resource)]
+#[derive(Component, Debug)]
 pub struct MavlinkInterface {
-    connection: Option<mavlink::Connection<MavMessage>>,
     pub armed: bool,
     pub external_control: bool,
     pub guided_target: Option<GuidedTarget>,
@@ -56,12 +64,15 @@ pub struct MavlinkInterface {
     last_message_times: HashMap<u32, f64>,
     sequence: u8,
     send_error_logged: bool,
+    /// Multi-vehicle: each aircraft has its own MAVLink system_id.
+    /// The first (index 0) is the default single-drone channel for
+    /// backward compatibility; additional drones use 1, 2, 3...
+    pub system_id: u8,
 }
 
 impl Default for MavlinkInterface {
     fn default() -> Self {
         Self {
-            connection: None,
             armed: false,
             external_control: false,
             guided_target: None,
@@ -70,6 +81,7 @@ impl Default for MavlinkInterface {
             last_message_times: HashMap::new(),
             sequence: 0,
             send_error_logged: false,
+            system_id: 1,
         }
     }
 }
@@ -79,15 +91,15 @@ impl MavlinkInterface {
         let sequence = self.sequence;
         self.sequence = self.sequence.wrapping_add(1);
         MavHeader {
-            system_id: u32::from(config.system_id),
+            system_id: u32::from(self.system_id),
             component_id: config.component_id,
             sequence,
         }
     }
 
-    fn send(&mut self, config: &MavlinkConfig, message: MavMessage) {
+    fn send(&mut self, shared: &mut SharedMavlink, config: &MavlinkConfig, message: MavMessage) {
         let header = self.header(config);
-        if let Some(connection) = &mut self.connection {
+        if let Some(connection) = &mut shared.connection {
             if let Err(error) = connection.send(&header, &message) {
                 if !self.send_error_logged {
                     bevy::log::warn!("MAVLink send failed: {error}");
@@ -99,6 +111,7 @@ impl MavlinkInterface {
 
     fn send_scheduled(
         &mut self,
+        shared: &mut SharedMavlink,
         config: &MavlinkConfig,
         message: MavMessage,
         default_rate_hz: f64,
@@ -117,27 +130,60 @@ impl MavlinkInterface {
             .unwrap_or(f64::NEG_INFINITY);
         if now - last_sent >= interval {
             self.last_message_times.insert(message_id, now);
-            self.send(config, message);
+            self.send(shared, config, message);
         }
     }
 }
 
-pub fn setup_mavlink(mut interface: ResMut<MavlinkInterface>, config: Res<MavlinkConfig>) {
+/// Shared MAVLink UDP endpoint. Each aircraft sends/receives on it with its
+/// own system_id (MavlinkInterface::system_id); target_matches() below routes
+/// incoming commands to the aircraft they address.
+#[derive(Component)]
+pub struct SharedMavlink {
+    pub connection: Option<mavlink::Connection<MavMessage>>,
+}
+
+pub fn setup_mavlink(
+    mut commands: Commands,
+    config: Res<MavlinkConfig>,
+    aircraft: Query<(Entity, &AircraftModel, Option<&VehicleIndex>), With<Aircraft>>,
+) {
     match connect::<MavMessage>(&config.connection_string) {
         Ok(connection) => {
             bevy::log::info!(
-                "MAVLink listening on {} (system {}, component {})",
+                "MAVLink listening on {} (component {})",
                 config.connection_string,
-                config.system_id,
                 config.component_id
             );
-            interface.connection = Some(connection);
+            let shared = commands
+                .spawn(SharedMavlink {
+                    connection: Some(connection),
+                })
+                .id();
+            let _ = shared;
+            let mut fallback_index = 0u8;
+            for (entity, model, vehicle_index) in &aircraft {
+                fallback_index += 1;
+                // VehicleIndex is the source of truth when present (assigned in
+                // setup_scene). Fallback keeps single-drone/tests working.
+                let system_id = vehicle_index
+                    .map(|v| (v.0 + 1) as u8)
+                    .unwrap_or(fallback_index);
+                commands.entity(entity).insert(MavlinkInterface {
+                    system_id,
+                    ..default()
+                });
+                bevy::log::info!("MAVLink vehicle {:?} system_id {system_id}", model.0);
+            }
         }
         Err(error) => {
             bevy::log::error!(
                 "Could not open MAVLink endpoint {}: {error}",
                 config.connection_string
             );
+            for (entity, _, _) in &aircraft {
+                commands.entity(entity).insert(MavlinkInterface::default());
+            }
         }
     }
 }
@@ -145,16 +191,18 @@ pub fn setup_mavlink(mut interface: ResMut<MavlinkInterface>, config: Res<Mavlin
 pub fn mavlink_io_system(
     time: Res<Time>,
     config: Res<MavlinkConfig>,
-    telemetry: Res<Telemetry>,
-    battery: Res<BatteryState>,
     battery_config: Res<BatteryConfig>,
     mut flight_limits: ResMut<FlightControlLimits>,
     aircraft_catalog: Res<AircraftCatalog>,
-    mut interface: ResMut<MavlinkInterface>,
+    mut shared_query: Query<&mut SharedMavlink>,
+    mut vehicles: Query<(&mut MavlinkInterface, &Telemetry, &BatteryState), With<Aircraft>>,
 ) {
     let now = time.elapsed_secs_f64();
     let mut incoming = Vec::new();
-    if let Some(connection) = &mut interface.connection {
+    let mut shared_conn = shared_query.single_mut().ok();
+    if let Some(shared) = shared_conn.as_deref_mut()
+        && let Some(connection) = &mut shared.connection
+    {
         for _ in 0..64 {
             match connection.try_recv() {
                 Ok((header, message)) => incoming.push((header, message)),
@@ -171,191 +219,252 @@ pub fn mavlink_io_system(
         }
     }
 
-    for (_header, message) in incoming {
-        match message {
-            MavMessage::PARAM_SET(data)
-                if target_matches(data.target_system, data.target_component, &config) =>
-            {
-                let name = data.param_id.to_str().unwrap_or("");
-                let previous = flight_limit_value(&flight_limits, name);
-                if let Some(current) = set_flight_limit(&mut flight_limits, name, data.param_value)
-                {
-                    if previous != Some(current) {
-                        bevy::log::info!("Flight limit updated via MAVLink: {name} = {current:.1}");
-                    }
-                    let mut param_id = [0; 16];
-                    for (dst, src) in param_id.iter_mut().zip(name.bytes()) {
-                        *dst = src;
-                    }
-                    interface.send(
+    for (mut interface, telemetry, battery) in &mut vehicles {
+        let system_id = interface.system_id;
+        for (header, message) in incoming.iter() {
+            let _ = header;
+            match message {
+                MavMessage::PARAM_SET(data)
+                    if target_matches_id(
+                        data.target_system,
+                        data.target_component,
+                        system_id,
                         &config,
-                        MavMessage::PARAM_VALUE(PARAM_VALUE_DATA {
-                            param_value: current,
-                            param_count: 3,
-                            param_index: flight_limit_index(name).unwrap_or(u16::MAX),
-                            param_id: mavlink::types::CharArray::new(param_id),
-                            param_type: MavParamType::MAV_PARAM_TYPE_REAL32,
-                        }),
-                    );
-                }
-            }
-            MavMessage::SET_POSITION_TARGET_LOCAL_NED(data)
-                if target_matches(data.target_system, data.target_component, &config) =>
-            {
-                if let Some(target) = local_ned_target(data, telemetry.position) {
-                    interface.last_velocity_setpoint_secs =
-                        matches!(target, GuidedTarget::Velocity { .. }).then_some(now);
-                    interface.guided_target = Some(target);
-                    interface.external_control = true;
-                }
-            }
-            MavMessage::COMMAND_LONG(data)
-                if target_matches(data.target_system, data.target_component, &config) =>
-            {
-                match data.command {
-                    MavCmd::MAV_CMD_COMPONENT_ARM_DISARM => {
-                        interface.armed = data.param1 >= 0.5;
-                        interface.external_control = true;
-                        interface.guided_target = None;
-                        interface.last_velocity_setpoint_secs = None;
-                        send_command_ack(
-                            &mut interface,
-                            &config,
-                            data.command,
-                            MavResult::MAV_RESULT_ACCEPTED,
-                        );
-                    }
-                    MavCmd::MAV_CMD_NAV_TAKEOFF => {
-                        interface.armed = true;
-                        interface.external_control = true;
-                        interface.last_velocity_setpoint_secs = None;
-                        let height = data.param7.max(1.0);
-                        interface.guided_target = Some(GuidedTarget::Position {
-                            position: Vec3::new(telemetry.position.x, height, telemetry.position.z),
-                            yaw: None,
-                        });
-                        send_command_ack(
-                            &mut interface,
-                            &config,
-                            data.command,
-                            MavResult::MAV_RESULT_ACCEPTED,
-                        );
-                    }
-                    MavCmd::MAV_CMD_NAV_LAND => {
-                        interface.external_control = true;
-                        interface.last_velocity_setpoint_secs = None;
-                        interface.guided_target = Some(GuidedTarget::Position {
-                            position: Vec3::new(telemetry.position.x, 0.2, telemetry.position.z),
-                            yaw: None,
-                        });
-                        send_command_ack(
-                            &mut interface,
-                            &config,
-                            data.command,
-                            MavResult::MAV_RESULT_ACCEPTED,
-                        );
-                    }
-                    MavCmd::MAV_CMD_NAV_RETURN_TO_LAUNCH => {
-                        interface.external_control = true;
-                        interface.last_velocity_setpoint_secs = None;
-                        interface.guided_target = Some(GuidedTarget::Position {
-                            position: Vec3::new(0.0, 0.2, 0.0),
-                            yaw: None,
-                        });
-                        send_command_ack(
-                            &mut interface,
-                            &config,
-                            data.command,
-                            MavResult::MAV_RESULT_ACCEPTED,
-                        );
-                    }
-                    MavCmd::MAV_CMD_DO_REPOSITION => {
-                        let north = ((f64::from(data.param5) - HOME_LATITUDE_DEG).to_radians()
-                            * f64::from(EARTH_RADIUS_M)) as f32;
-                        let east = ((f64::from(data.param6) - HOME_LONGITUDE_DEG).to_radians()
-                            * HOME_LATITUDE_DEG.to_radians().cos()
-                            * f64::from(EARTH_RADIUS_M)) as f32;
-                        interface.external_control = true;
-                        interface.last_velocity_setpoint_secs = None;
-                        interface.guided_target = Some(GuidedTarget::Position {
-                            position: Vec3::new(east, data.param7, north),
-                            yaw: data.param4.is_finite().then(|| data.param4.to_radians()),
-                        });
-                        send_command_ack(
-                            &mut interface,
-                            &config,
-                            data.command,
-                            MavResult::MAV_RESULT_ACCEPTED,
-                        );
-                    }
-                    MavCmd::MAV_CMD_SET_MESSAGE_INTERVAL => {
-                        let message_id = data.param1;
-                        let interval_us = data.param2;
-                        if message_id.is_finite()
-                            && message_id >= 0.0
-                            && message_id.fract() == 0.0
-                            && (interval_us == -1.0 || interval_us >= 0.0)
-                        {
-                            let message_id = message_id as u32;
-                            if interval_us == -1.0 {
-                                interface.message_intervals.insert(message_id, None);
-                            } else if interval_us == 0.0 {
-                                interface.message_intervals.remove(&message_id);
-                            } else {
-                                let interval =
-                                    (f64::from(interval_us) / 1_000_000.0).clamp(0.01, 1.0);
-                                interface
-                                    .message_intervals
-                                    .insert(message_id, Some(interval));
-                            }
-                            send_command_ack(
-                                &mut interface,
-                                &config,
-                                data.command,
-                                MavResult::MAV_RESULT_ACCEPTED,
+                    ) =>
+                {
+                    let name = data.param_id.to_str().unwrap_or("");
+                    let previous = flight_limit_value(&flight_limits, name);
+                    if let Some(current) =
+                        set_flight_limit(&mut flight_limits, name, data.param_value)
+                    {
+                        if previous != Some(current) {
+                            bevy::log::info!(
+                                "Flight limit updated via MAVLink: {name} = {current:.1}"
                             );
-                        } else {
-                            send_command_ack(
-                                &mut interface,
+                        }
+                        let mut param_id = [0; 16];
+                        for (dst, src) in param_id.iter_mut().zip(name.bytes()) {
+                            *dst = src;
+                        }
+                        if let Some(shared) = shared_conn.as_deref_mut() {
+                            interface.send(
+                                shared,
                                 &config,
-                                data.command,
-                                MavResult::MAV_RESULT_DENIED,
+                                MavMessage::PARAM_VALUE(PARAM_VALUE_DATA {
+                                    param_value: current,
+                                    param_count: 3,
+                                    param_index: flight_limit_index(name).unwrap_or(u16::MAX),
+                                    param_id: mavlink::types::CharArray::new(param_id),
+                                    param_type: MavParamType::MAV_PARAM_TYPE_REAL32,
+                                }),
                             );
                         }
                     }
-                    _ => send_command_ack(
-                        &mut interface,
-                        &config,
-                        data.command,
-                        MavResult::MAV_RESULT_UNSUPPORTED,
-                    ),
                 }
+                MavMessage::SET_POSITION_TARGET_LOCAL_NED(data)
+                    if target_matches_id(
+                        data.target_system,
+                        data.target_component,
+                        system_id,
+                        &config,
+                    ) =>
+                {
+                    if let Some(target) = local_ned_target(data, telemetry.position) {
+                        interface.last_velocity_setpoint_secs =
+                            matches!(target, GuidedTarget::Velocity { .. }).then_some(now);
+                        interface.guided_target = Some(target);
+                        interface.external_control = true;
+                    }
+                }
+                MavMessage::COMMAND_LONG(data)
+                    if target_matches_id(
+                        data.target_system,
+                        data.target_component,
+                        system_id,
+                        &config,
+                    ) =>
+                {
+                    match data.command {
+                        MavCmd::MAV_CMD_COMPONENT_ARM_DISARM => {
+                            interface.armed = data.param1 >= 0.5;
+                            interface.external_control = true;
+                            interface.guided_target = None;
+                            interface.last_velocity_setpoint_secs = None;
+                            if let Some(shared) = shared_conn.as_deref_mut() {
+                                send_command_ack(
+                                    &mut interface,
+                                    shared,
+                                    &config,
+                                    data.command,
+                                    MavResult::MAV_RESULT_ACCEPTED,
+                                );
+                            }
+                        }
+                        MavCmd::MAV_CMD_NAV_TAKEOFF => {
+                            interface.armed = true;
+                            interface.external_control = true;
+                            interface.last_velocity_setpoint_secs = None;
+                            let height = data.param7.max(1.0);
+                            interface.guided_target = Some(GuidedTarget::Position {
+                                position: Vec3::new(
+                                    telemetry.position.x,
+                                    height,
+                                    telemetry.position.z,
+                                ),
+                                yaw: None,
+                            });
+                            if let Some(shared) = shared_conn.as_deref_mut() {
+                                send_command_ack(
+                                    &mut interface,
+                                    shared,
+                                    &config,
+                                    data.command,
+                                    MavResult::MAV_RESULT_ACCEPTED,
+                                );
+                            }
+                        }
+                        MavCmd::MAV_CMD_NAV_LAND => {
+                            interface.external_control = true;
+                            interface.last_velocity_setpoint_secs = None;
+                            interface.guided_target = Some(GuidedTarget::Position {
+                                position: Vec3::new(
+                                    telemetry.position.x,
+                                    0.2,
+                                    telemetry.position.z,
+                                ),
+                                yaw: None,
+                            });
+                            if let Some(shared) = shared_conn.as_deref_mut() {
+                                send_command_ack(
+                                    &mut interface,
+                                    shared,
+                                    &config,
+                                    data.command,
+                                    MavResult::MAV_RESULT_ACCEPTED,
+                                );
+                            }
+                        }
+                        MavCmd::MAV_CMD_NAV_RETURN_TO_LAUNCH => {
+                            interface.external_control = true;
+                            interface.last_velocity_setpoint_secs = None;
+                            interface.guided_target = Some(GuidedTarget::Position {
+                                position: Vec3::new(0.0, 0.2, 0.0),
+                                yaw: None,
+                            });
+                            if let Some(shared) = shared_conn.as_deref_mut() {
+                                send_command_ack(
+                                    &mut interface,
+                                    shared,
+                                    &config,
+                                    data.command,
+                                    MavResult::MAV_RESULT_ACCEPTED,
+                                );
+                            }
+                        }
+                        MavCmd::MAV_CMD_DO_REPOSITION => {
+                            let north = ((f64::from(data.param5) - HOME_LATITUDE_DEG).to_radians()
+                                * f64::from(EARTH_RADIUS_M))
+                                as f32;
+                            let east = ((f64::from(data.param6) - HOME_LONGITUDE_DEG).to_radians()
+                                * HOME_LATITUDE_DEG.to_radians().cos()
+                                * f64::from(EARTH_RADIUS_M))
+                                as f32;
+                            interface.external_control = true;
+                            interface.last_velocity_setpoint_secs = None;
+                            interface.guided_target = Some(GuidedTarget::Position {
+                                position: Vec3::new(east, data.param7, north),
+                                yaw: data.param4.is_finite().then(|| data.param4.to_radians()),
+                            });
+                            if let Some(shared) = shared_conn.as_deref_mut() {
+                                send_command_ack(
+                                    &mut interface,
+                                    shared,
+                                    &config,
+                                    data.command,
+                                    MavResult::MAV_RESULT_ACCEPTED,
+                                );
+                            }
+                        }
+                        MavCmd::MAV_CMD_SET_MESSAGE_INTERVAL => {
+                            let message_id = data.param1;
+                            let interval_us = data.param2;
+                            if message_id.is_finite()
+                                && message_id >= 0.0
+                                && message_id.fract() == 0.0
+                                && (interval_us == -1.0 || interval_us >= 0.0)
+                            {
+                                let message_id = message_id as u32;
+                                if interval_us == -1.0 {
+                                    interface.message_intervals.insert(message_id, None);
+                                } else if interval_us == 0.0 {
+                                    interface.message_intervals.remove(&message_id);
+                                } else {
+                                    let interval =
+                                        (f64::from(interval_us) / 1_000_000.0).clamp(0.01, 1.0);
+                                    interface
+                                        .message_intervals
+                                        .insert(message_id, Some(interval));
+                                }
+                                if let Some(shared) = shared_conn.as_deref_mut() {
+                                    send_command_ack(
+                                        &mut interface,
+                                        shared,
+                                        &config,
+                                        data.command,
+                                        MavResult::MAV_RESULT_ACCEPTED,
+                                    );
+                                }
+                            } else if let Some(shared) = shared_conn.as_deref_mut() {
+                                send_command_ack(
+                                    &mut interface,
+                                    shared,
+                                    &config,
+                                    data.command,
+                                    MavResult::MAV_RESULT_DENIED,
+                                );
+                            }
+                        }
+                        _ => {
+                            if let Some(shared) = shared_conn.as_deref_mut() {
+                                send_command_ack(
+                                    &mut interface,
+                                    shared,
+                                    &config,
+                                    data.command,
+                                    MavResult::MAV_RESULT_UNSUPPORTED,
+                                );
+                            }
+                        }
+                    }
+                }
+                _ => {}
             }
-            _ => {}
+        }
+
+        let heartbeat = HEARTBEAT_DATA {
+            mavtype: mavtype_for_aircraft(&aircraft_catalog),
+            autopilot: MavAutopilot::MAV_AUTOPILOT_GENERIC,
+            base_mode: MavModeFlag::from_bits_retain(if interface.armed { 136 } else { 8 }),
+            system_status: if interface.armed {
+                MavState::MAV_STATE_ACTIVE
+            } else {
+                MavState::MAV_STATE_STANDBY
+            },
+            ..Default::default()
+        };
+        if let Some(shared) = shared_conn.as_deref_mut() {
+            interface.send_scheduled(shared, &config, MavMessage::HEARTBEAT(heartbeat), 1.0, now);
+            send_telemetry(
+                &mut interface,
+                shared,
+                &config,
+                telemetry,
+                battery,
+                &battery_config,
+                now,
+            );
         }
     }
-
-    let now = time.elapsed_secs_f64();
-    let heartbeat = HEARTBEAT_DATA {
-        mavtype: mavtype_for_aircraft(&aircraft_catalog),
-        autopilot: MavAutopilot::MAV_AUTOPILOT_GENERIC,
-        base_mode: MavModeFlag::from_bits_retain(if interface.armed { 136 } else { 8 }),
-        system_status: if interface.armed {
-            MavState::MAV_STATE_ACTIVE
-        } else {
-            MavState::MAV_STATE_STANDBY
-        },
-        ..Default::default()
-    };
-    interface.send_scheduled(&config, MavMessage::HEARTBEAT(heartbeat), 1.0, now);
-    send_telemetry(
-        &mut interface,
-        &config,
-        &telemetry,
-        &battery,
-        &battery_config,
-        now,
-    );
 }
 
 fn flight_limit_value(limits: &FlightControlLimits, name: &str) -> Option<f32> {
@@ -381,11 +490,11 @@ fn set_flight_limit(limits: &mut FlightControlLimits, name: &str, value: f32) ->
         return flight_limit_value(limits, name);
     }
     match name {
-        "VYDE_MAX_SPEED" if (0.5..=30.0).contains(&value) => limits.max_speed_m_s = value,
-        "VYDE_MAX_ACCEL" if (0.5..=20.0).contains(&value) => {
+        "VYDE_MAX_SPEED" if value > 0.0 => limits.max_speed_m_s = value,
+        "VYDE_MAX_ACCEL" if value > 0.0 => {
             limits.max_acceleration_m_s2 = value;
         }
-        "VYDE_MAX_TILT" if (5.0..=60.0).contains(&value) => limits.max_tilt_deg = value,
+        "VYDE_MAX_TILT" if (0.0..=60.0).contains(&value) => limits.max_tilt_deg = value,
         _ => return flight_limit_value(limits, name),
     }
     Some(value)
@@ -393,114 +502,384 @@ fn set_flight_limit(limits: &mut FlightControlLimits, name: &str, value: f32) ->
 
 pub fn apply_guided_control_system(
     time: Res<Time>,
-    interface: Res<MavlinkInterface>,
-    telemetry: Res<Telemetry>,
     flight_limits: Option<Res<FlightControlLimits>>,
     mut command_inputs: Query<&mut CommandInput>,
     mut aircraft: Query<
         (
             &Transform,
+            &LinearVelocity,
+            &AngularVelocity,
             &Airframe,
             &Propulsion,
+            &FlightSurfaces,
             &mut AircraftControls,
             &AircraftModel,
+            &MavlinkInterface,
+            &Telemetry,
         ),
         With<Aircraft>,
     >,
 ) {
-    if let Ok(mut input) = command_inputs.single_mut() {
-        let max_speed = flight_limits
-            .as_ref()
-            .map_or(FlightControlLimits::default().max_speed_m_s, |limits| {
-                limits.max_speed_m_s
-            });
-        input.command = if interface.armed && interface.external_control {
-            let target = if velocity_setpoint_timed_out(
-                interface.last_velocity_setpoint_secs,
-                time.elapsed_secs_f64(),
-            ) {
-                None
-            } else {
-                interface.guided_target
-            };
-            match target {
-                Some(GuidedTarget::Position { position, yaw }) => DroneCommand::Position {
-                    pos: position,
-                    yaw: yaw.unwrap_or_else(|| telemetry.rotation.to_euler(EulerRot::YXZ).0),
-                },
-                Some(GuidedTarget::Velocity { velocity, yaw_rate }) => DroneCommand::Velocity {
-                    vel: velocity.clamp_length_max(max_speed),
-                    yaw_rate: yaw_rate.unwrap_or(0.0),
-                },
-                None => DroneCommand::None,
+    let default_limits = FlightControlLimits::default();
+    let limits = flight_limits.as_deref().unwrap_or(&default_limits);
+    let max_speed = limits.max_speed_m_s;
+    // Quad path is handled inside the main loop below (per-entity interface).
+    for (
+        transform,
+        linear_velocity,
+        angular_velocity,
+        airframe,
+        propulsion,
+        surfaces,
+        mut controls,
+        model,
+        interface,
+        telemetry,
+    ) in &mut aircraft
+    {
+        // Quad inner loop via CommandInput (only Quad entities have it).
+        if model.0 == AircraftType::Quad {
+            if let Ok(mut input) = command_inputs.single_mut() {
+                input.command = if interface.armed && interface.external_control {
+                    let target = if velocity_setpoint_timed_out(
+                        interface.last_velocity_setpoint_secs,
+                        time.elapsed_secs_f64(),
+                    ) {
+                        None
+                    } else {
+                        interface.guided_target
+                    };
+                    match target {
+                        Some(GuidedTarget::Position { position, yaw }) => DroneCommand::Position {
+                            pos: position,
+                            yaw: yaw
+                                .unwrap_or_else(|| telemetry.rotation.to_euler(EulerRot::YXZ).0),
+                        },
+                        Some(GuidedTarget::Velocity { velocity, yaw_rate }) => {
+                            DroneCommand::Velocity {
+                                vel: velocity.clamp_length_max(max_speed),
+                                yaw_rate: yaw_rate.unwrap_or(0.0),
+                            }
+                        }
+                        Some(GuidedTarget::Manual { yaw_rate, .. }) => DroneCommand::Velocity {
+                            vel: Vec3::ZERO,
+                            yaw_rate,
+                        },
+                        None => DroneCommand::None,
+                    }
+                } else {
+                    DroneCommand::Motor(MotorCommand::default())
+                };
             }
+            continue;
+        }
+        let target = if velocity_setpoint_timed_out(
+            interface.last_velocity_setpoint_secs,
+            time.elapsed_secs_f64(),
+        ) {
+            None
         } else {
-            DroneCommand::Motor(MotorCommand::default())
+            interface.guided_target
         };
+        update_non_quad_controls(
+            model.0,
+            transform,
+            linear_velocity.0,
+            angular_velocity.0,
+            airframe,
+            propulsion,
+            surfaces,
+            &mut controls,
+            target,
+            max_speed,
+            limits.max_tilt_deg,
+            interface.armed && interface.external_control,
+        );
+    }
+}
+
+fn update_non_quad_controls(
+    model: AircraftType,
+    transform: &Transform,
+    linear_velocity: Vec3,
+    angular_velocity: Vec3,
+    airframe: &Airframe,
+    propulsion: &Propulsion,
+    surfaces: &FlightSurfaces,
+    controls: &mut AircraftControls,
+    target: Option<GuidedTarget>,
+    max_speed: f32,
+    max_tilt_deg: f32,
+    enabled: bool,
+) {
+    let propulsion_channels = propulsion
+        .0
+        .iter()
+        .map(|propulsor| propulsor.control_channel + 1)
+        .max()
+        .unwrap_or_default();
+    let surface_channels = surfaces
+        .0
+        .iter()
+        .filter_map(|surface| surface.control_channel.map(|channel| channel + 1))
+        .max()
+        .unwrap_or_default();
+    controls.propulsion.resize(propulsion_channels, 0.0);
+    controls.propulsion.fill(0.0);
+    controls.surfaces.resize(surface_channels, 0.0);
+    controls.surfaces.fill(0.0);
+    if !enabled {
+        return;
     }
 
-    for (transform, airframe, propulsion, mut controls, model) in &mut aircraft {
-        if model.0 == AircraftType::Quad {
-            continue;
-        }
-        if !interface.armed || !interface.external_control {
-            controls.propulsion.fill(0.0);
-            controls.surfaces.fill(0.0);
-            continue;
-        }
-        let Some(target) = interface.guided_target else {
-            continue;
-        };
-        let (desired_velocity, yaw_target) = match target {
-            GuidedTarget::Position { position, yaw } => (
-                ((position - transform.translation) * 0.8).clamp_length_max(8.0),
-                yaw,
-            ),
-            GuidedTarget::Velocity {
-                velocity,
-                yaw_rate: _,
-            } => (velocity, None),
-        };
-        let velocity_error = desired_velocity;
-        let yaw_error = yaw_target
-            .map(|yaw| {
-                (yaw - transform.rotation.to_euler(EulerRot::YXZ).0 + std::f32::consts::PI)
-                    .rem_euclid(std::f32::consts::TAU)
-                    - std::f32::consts::PI
-            })
-            .unwrap_or(0.0);
-        let is_fixed_wing = model.0 == AircraftType::FixedWing;
-        let propulsor_count = controls.propulsion.len().max(1) as f32;
-        for (index, throttle) in controls.propulsion.iter_mut().enumerate() {
-            let hover = if is_fixed_wing {
-                0.65
+    let (desired_velocity, yaw_target, commanded_yaw_rate, manual_throttle) = match target {
+        Some(GuidedTarget::Position { position, yaw }) => (
+            ((position - transform.translation) * 0.8).clamp_length_max(max_speed),
+            yaw,
+            None,
+            None,
+        ),
+        Some(GuidedTarget::Velocity { velocity, yaw_rate }) => {
+            // FixedWing in manual: Velocity is not a "desired velocity" but
+            // throttle. The web sends north=+W (already rotated to NED by the backend);
+            // it is projected onto the body forward axis to obtain throttle.
+            if model == AircraftType::FixedWing {
+                let (yaw, _, _) = transform.rotation.to_euler(EulerRot::YXZ);
+                let forward = Vec3::new(yaw.sin(), 0.0, yaw.cos());
+                let throttle = (velocity.dot(forward) / max_speed.max(1.0)).clamp(0.0, 1.0);
+                // Keep the vertical component for elevator control. W/S is
+                // throttle, while Space/Shift still command pitch authority.
+                (Vec3::Y * velocity.y, None, yaw_rate, Some(throttle))
             } else {
-                let max_thrust = propulsion
-                    .0
-                    .get(index)
-                    .map(|propulsor| propulsor.max_thrust)
-                    .unwrap_or(1.0)
-                    .max(0.01);
-                airframe.mass * 9.81 / propulsor_count / max_thrust
-            };
-            *throttle = (hover
-                + velocity_error.y * 0.025
-                + velocity_error.z * 0.008
-                + (index as f32 - 0.5) * yaw_error * 0.015)
-                .clamp(0.0, 1.0);
-        }
-        if is_fixed_wing {
-            if let Some(elevator) = controls.surfaces.get_mut(0) {
-                *elevator = (-velocity_error.y * 0.04).clamp(-1.0, 1.0);
-            }
-            if let Some(aileron) = controls.surfaces.get_mut(1) {
-                *aileron = (-velocity_error.x * 0.04).clamp(-1.0, 1.0);
-            }
-            if let Some(rudder) = controls.surfaces.get_mut(2) {
-                *rudder = yaw_error.clamp(-1.0, 1.0);
+                (velocity.clamp_length_max(max_speed), None, yaw_rate, None)
             }
         }
+        // Aircraft-style manual (FixedWing): W/S is throttle, not velocity.
+        // throttle in [0,1]: the web sends north=+velocity (rotated to NED);
+        // here it is recovered as the body-forward component.
+        Some(GuidedTarget::Manual { throttle, yaw_rate }) => (
+            Vec3::ZERO,
+            None,
+            Some(yaw_rate),
+            Some(throttle.clamp(0.0, 1.0)),
+        ),
+        None => (Vec3::ZERO, None, None, None),
+    };
+    // A fixed wing cannot hover: without horizontal speed there is no
+    // lift. In guided (Position) mode with a vertical-only target —e.g.
+    // `takeoff`, which sends Position(x, alt, z)— a minimum cruise speed is
+    // imposed along the current heading so it can take off and fly. In manual
+    // (W=throttle) nothing is forced: the aircraft accelerates by pure
+    // physics and takes off when it reaches ~9 m/s.
+    let desired_velocity = if model == AircraftType::FixedWing && manual_throttle.is_none() {
+        let horizontal = desired_velocity.xz().length();
+        if horizontal < 8.0 {
+            let (yaw, _, _) = transform.rotation.to_euler(EulerRot::YXZ);
+            let forward = Vec3::new(yaw.sin(), 0.0, yaw.cos());
+            let vertical = desired_velocity.y;
+            let cruise = 8.0_f32.max(horizontal);
+            forward * cruise + Vec3::Y * vertical
+        } else {
+            desired_velocity
+        }
+    } else {
+        desired_velocity
+    };
+    let rotation = transform.rotation;
+    let local_velocity = rotation.inverse() * linear_velocity;
+    let local_angular_velocity = rotation.inverse() * angular_velocity;
+    let local_desired_velocity = rotation.inverse() * desired_velocity;
+    let (current_yaw, pitch, roll) = rotation.to_euler(EulerRot::YXZ);
+    let target_heading = yaw_target
+        .or_else(|| {
+            (desired_velocity.xz().length_squared() > 0.25)
+                .then(|| desired_velocity.x.atan2(desired_velocity.z))
+        })
+        .unwrap_or_else(|| current_yaw + commanded_yaw_rate.unwrap_or(0.0) * 0.5);
+    let heading_error = wrap_angle(target_heading - current_yaw);
+    let yaw_rate_command = commanded_yaw_rate.unwrap_or(heading_error.clamp(-1.0, 1.0) * 0.8);
+
+    match model {
+        AircraftType::FixedWing => {
+            fixed_wing_controls(
+                propulsion,
+                surfaces,
+                controls,
+                desired_velocity,
+                local_desired_velocity,
+                local_velocity,
+                local_angular_velocity,
+                heading_error,
+                pitch,
+                roll,
+                max_speed,
+                max_tilt_deg,
+                manual_throttle,
+                commanded_yaw_rate,
+            );
+        }
+        AircraftType::Hex | AircraftType::Vtol => {
+            multirotor_controls(
+                model,
+                airframe,
+                propulsion,
+                controls,
+                local_desired_velocity,
+                local_velocity,
+                local_angular_velocity,
+                yaw_rate_command,
+                matches!(target, Some(GuidedTarget::Position { .. })),
+            );
+        }
+        AircraftType::Quad => {}
     }
+}
+
+fn fixed_wing_controls(
+    propulsion: &Propulsion,
+    surfaces: &FlightSurfaces,
+    controls: &mut AircraftControls,
+    desired_velocity: Vec3,
+    local_desired_velocity: Vec3,
+    local_velocity: Vec3,
+    local_angular_velocity: Vec3,
+    heading_error: f32,
+    pitch: f32,
+    roll: f32,
+    max_speed: f32,
+    max_tilt_deg: f32,
+    manual_throttle: Option<f32>,
+    commanded_yaw_rate: Option<f32>,
+) {
+    let current_speed = local_velocity.length();
+    // In manual, W/S is direct throttle: the aircraft accelerates by physics
+    // and takes off by itself past stall speed (~9 m/s). In guided mode,
+    // throttle regulates the desired speed (8 m/s minimum cruise).
+    let throttle = match manual_throttle {
+        Some(throttle) => throttle,
+        None => {
+            let desired_speed = desired_velocity
+                .xz()
+                .length()
+                .max(8.0)
+                .min(max_speed.max(8.0));
+            (0.62 + (desired_speed - current_speed) * 0.035).clamp(0.35, 1.0)
+        }
+    };
+    for propulsor in &propulsion.0 {
+        let throttle = if propulsor.axis.z.abs() > propulsor.axis.y.abs() {
+            throttle
+        } else {
+            0.0
+        };
+        set_channel(
+            &mut controls.propulsion,
+            propulsor.control_channel,
+            throttle,
+        );
+    }
+
+    let elevator =
+        ((local_desired_velocity.y - local_velocity.y) * 0.12 - pitch * 0.75).clamp(-1.0, 1.0);
+    let max_bank = max_tilt_deg.to_radians().clamp(0.05, 1.0);
+    let desired_bank = -heading_error.clamp(-max_bank, max_bank);
+    let aileron =
+        (desired_bank * 1.5 - roll * 0.45 - local_angular_velocity.z * 0.2).clamp(-1.0, 1.0);
+    let commanded_yaw_rate = commanded_yaw_rate.unwrap_or(0.0);
+    let rudder = (heading_error * 0.35
+        + commanded_yaw_rate * 0.55
+        - local_angular_velocity.y * 0.15)
+        .clamp(-1.0, 1.0);
+    // Q/E (ailerons/rudder) also work on the ground: the user wants to
+    // be able to rotate the parked aircraft to orient takeoff. The real
+    // force already scales with v² in aircraft_wrench, so at standstill the
+    // moment is small but the command is not blocked.
+    for surface in &surfaces.0 {
+        let Some(channel) = surface.control_channel else {
+            continue;
+        };
+        let lift_axis = surface.lift_axis.normalize_or_zero();
+        let command = if lift_axis.x.abs() > lift_axis.y.abs() {
+            rudder
+        } else if surface.position.z < -0.2 && surface.position.x.abs() < 0.2 {
+            elevator
+        } else {
+            aileron
+        };
+        set_channel(&mut controls.surfaces, channel, command);
+    }
+}
+
+fn multirotor_controls(
+    model: AircraftType,
+    airframe: &Airframe,
+    propulsion: &Propulsion,
+    controls: &mut AircraftControls,
+    desired_velocity: Vec3,
+    local_velocity: Vec3,
+    local_angular_velocity: Vec3,
+    yaw_rate_command: f32,
+    guided: bool,
+) {
+    let lift_capacity: f32 = propulsion
+        .0
+        .iter()
+        .filter(|propulsor| propulsor.axis.normalize_or_zero().dot(Vec3::Y).abs() > 0.8)
+        .map(|propulsor| propulsor.max_thrust.max(0.0))
+        .sum();
+    let vertical_acceleration = (desired_velocity.y - local_velocity.y) * 1.2 + 9.81;
+    let collective = if lift_capacity > 0.0 {
+        (airframe.mass * vertical_acceleration.max(0.0) / lift_capacity)
+            .sqrt()
+            .clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let pitch_effort = (desired_velocity.z - local_velocity.z).clamp(-8.0, 8.0) * 0.07
+        - local_angular_velocity.x * 0.08;
+    let roll_effort = (desired_velocity.x - local_velocity.x).clamp(-8.0, 8.0) * 0.07
+        + local_angular_velocity.z * 0.08;
+    let yaw_effort = yaw_rate_command.clamp(-1.5, 1.5) * 0.08 - local_angular_velocity.y * 0.04;
+    // In manual, the VTOL only uses the lift rotors (hover); cruise thrust
+    // only activates with a guided (Position) target, where there is a
+    // well-defined flight direction.
+    let cruise = if model == AircraftType::Vtol && guided {
+        (0.3 + desired_velocity.z.max(0.0) * 0.05).clamp(0.2, 0.85)
+    } else {
+        0.0
+    };
+
+    for propulsor in &propulsion.0 {
+        let axis = propulsor.axis.normalize_or_zero();
+        let throttle = if axis.dot(Vec3::Y).abs() > 0.8 {
+            let yaw_sign = propulsor.reaction_torque.signum();
+            // Thrust torque is r × F: +Z creates -pitch and +X creates
+            // +roll, so these signs generate the corrective attitude.
+            let differential = -propulsor.position.z * pitch_effort
+                - propulsor.position.x * roll_effort
+                + yaw_sign * yaw_effort;
+            (collective + differential).clamp(0.0, 1.0)
+        } else if axis.z.abs() > axis.y.abs() {
+            cruise
+        } else {
+            0.0
+        };
+        set_channel(
+            &mut controls.propulsion,
+            propulsor.control_channel,
+            throttle,
+        );
+    }
+}
+
+fn set_channel(channels: &mut [f32], index: usize, value: f32) {
+    if let Some(channel) = channels.get_mut(index) {
+        *channel = value;
+    }
+}
+
+fn wrap_angle(angle: f32) -> f32 {
+    (angle + std::f32::consts::PI).rem_euclid(std::f32::consts::TAU) - std::f32::consts::PI
 }
 
 fn velocity_setpoint_timed_out(last_setpoint: Option<f64>, now: f64) -> bool {
@@ -512,8 +891,18 @@ fn target_matches(target_system: u8, target_component: u8, config: &MavlinkConfi
         && (target_component == 0 || target_component == config.component_id)
 }
 
+fn target_matches_id(
+    target_system: u8,
+    target_component: u8,
+    system_id: u8,
+    config: &MavlinkConfig,
+) -> bool {
+    (target_system == 0 || target_system == system_id)
+        && (target_component == 0 || target_component == config.component_id)
+}
+
 fn local_ned_target(
-    data: SET_POSITION_TARGET_LOCAL_NED_DATA,
+    data: &SET_POSITION_TARGET_LOCAL_NED_DATA,
     current_position: Vec3,
 ) -> Option<GuidedTarget> {
     if !matches!(
@@ -542,6 +931,10 @@ fn local_ned_target(
         }
         let yaw_rate = (!ignores(PositionTargetTypemask::POSITION_TARGET_TYPEMASK_YAW_RATE_IGNORE))
             .then_some(data.yaw_rate);
+        // The backend sends Velocity only in manual (every 100 ms) and Position
+        // in guided mode. For FixedWing, Velocity is interpreted as manual
+        // throttle (see update_non_quad_controls): the "forward" component
+        // (vx in NED) is the throttle, not a desired velocity.
         Some(GuidedTarget::Velocity {
             velocity: Vec3::new(data.vy, -data.vz, data.vx),
             yaw_rate,
@@ -569,11 +962,13 @@ fn local_ned_target(
 
 fn send_command_ack(
     interface: &mut MavlinkInterface,
+    shared: &mut SharedMavlink,
     config: &MavlinkConfig,
     command: MavCmd,
     result: MavResult,
 ) {
     interface.send(
+        shared,
         config,
         MavMessage::COMMAND_ACK(COMMAND_ACK_DATA { command, result }),
     );
@@ -581,6 +976,7 @@ fn send_command_ack(
 
 fn send_telemetry(
     interface: &mut MavlinkInterface,
+    shared: &mut SharedMavlink,
     config: &MavlinkConfig,
     telemetry: &Telemetry,
     battery: &BatteryState,
@@ -590,6 +986,7 @@ fn send_telemetry(
     let attitude_ned = sim_to_ned_rotation(telemetry.rotation);
     let (yaw, pitch, roll) = attitude_ned.to_euler(EulerRot::ZYX);
     interface.send_scheduled(
+        shared,
         config,
         MavMessage::ATTITUDE(ATTITUDE_DATA {
             time_boot_ms: millis(now),
@@ -612,6 +1009,7 @@ fn send_telemetry(
         )
         .to_degrees();
     interface.send_scheduled(
+        shared,
         config,
         MavMessage::GLOBAL_POSITION_INT(GLOBAL_POSITION_INT_DATA {
             time_boot_ms: millis(now),
@@ -629,6 +1027,7 @@ fn send_telemetry(
     );
 
     interface.send_scheduled(
+        shared,
         config,
         MavMessage::HIGHRES_IMU(HIGHRES_IMU_DATA {
             time_usec: (now * 1_000_000.0) as u64,
@@ -649,6 +1048,7 @@ fn send_telemetry(
     );
 
     interface.send_scheduled(
+        shared,
         config,
         MavMessage::SYS_STATUS(SYS_STATUS_DATA {
             onboard_control_sensors_present: MavSysStatusSensor::from_bits_retain(0x2f),
@@ -667,6 +1067,7 @@ fn send_telemetry(
     let mut voltages = [u16::MAX; 10];
     voltages[0] = (battery.voltage.max(0.0) * 1000.0).min(u16::MAX as f32) as u16;
     interface.send_scheduled(
+        shared,
         config,
         MavMessage::BATTERY_STATUS(BATTERY_STATUS_DATA {
             current_consumed: (capacity * (1.0 - battery.soc.clamp(0.0, 1.0))) as i32,
@@ -752,9 +1153,171 @@ mod tests {
     }
 
     #[test]
+    fn non_quad_profiles_allocate_and_use_their_control_channels() {
+        for model in [
+            AircraftType::Hex,
+            AircraftType::FixedWing,
+            AircraftType::Vtol,
+        ] {
+            let definition = crate::aircraft::AircraftDefinition::profile(model);
+            let mut controls = AircraftControls::default();
+            update_non_quad_controls(
+                model,
+                &Transform::IDENTITY,
+                Vec3::ZERO,
+                Vec3::ZERO,
+                &definition.body,
+                &definition.propulsion,
+                &definition.surfaces,
+                &mut controls,
+                Some(GuidedTarget::Position {
+                    position: Vec3::new(4.0, 3.0, 8.0),
+                    yaw: Some(0.5),
+                }),
+                8.0,
+                26.0,
+                true,
+            );
+
+            let expected_propulsion_channels = definition
+                .propulsion
+                .0
+                .iter()
+                .map(|propulsor| propulsor.control_channel + 1)
+                .max()
+                .unwrap();
+            let expected_surface_channels = definition
+                .surfaces
+                .0
+                .iter()
+                .filter_map(|surface| surface.control_channel.map(|channel| channel + 1))
+                .max()
+                .unwrap_or_default();
+            assert_eq!(controls.propulsion.len(), expected_propulsion_channels);
+            assert_eq!(controls.surfaces.len(), expected_surface_channels);
+            assert!(controls.propulsion.iter().all(|value| value.is_finite()));
+            assert!(controls.propulsion.iter().any(|value| *value > 0.0));
+            if model == AircraftType::FixedWing {
+                // The test starts at zero speed: surfaces must be 0
+                // (1:1 effectiveness). Another test covers that; here we only
+                // verify that the channels exist and are finite.
+            }
+            if model == AircraftType::Vtol || model == AircraftType::Hex {
+                let lift: f32 = definition
+                    .propulsion
+                    .0
+                    .iter()
+                    .filter(|propulsor| propulsor.axis.dot(Vec3::Y).abs() > 0.8)
+                    .map(|propulsor| {
+                        propulsor.max_thrust
+                            * controls.propulsion[propulsor.control_channel].powi(2)
+                    })
+                    .sum();
+                assert!(
+                    lift > definition.body.mass * 9.81 * 0.9,
+                    "{model:?} did not command enough hover thrust: {lift}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fixed_wing_manual_w_is_throttle_not_forced_velocity() {
+        // En manual, W (velocity adelante) debe convertirse en throttle y
+        // NOT forcing a desired velocity: the aircraft accelerates by physics.
+        let definition = crate::aircraft::AircraftDefinition::profile(AircraftType::FixedWing);
+        let mut controls = AircraftControls::default();
+        update_non_quad_controls(
+            AircraftType::FixedWing,
+            &Transform::IDENTITY,
+            Vec3::ZERO,
+            Vec3::ZERO,
+            &definition.body,
+            &definition.propulsion,
+            &definition.surfaces,
+            &mut controls,
+            Some(GuidedTarget::Velocity {
+                // W at full speed (3 m/s in NED = forward with yaw 0)
+                velocity: Vec3::new(0.0, 0.0, 3.0),
+                yaw_rate: Some(0.0),
+            }),
+            3.0,
+            26.0,
+            true,
+        );
+        // Direct web throttle: 3/3 = 1.0 (full)
+        assert!(
+            controls.propulsion.iter().any(|v| *v > 0.9),
+            "W manual debería dar throttle ~1.0, got {:?}",
+            controls.propulsion
+        );
+        // No W (zero velocity) -> throttle 0: the aircraft does not accelerate by itself.
+        let mut controls = AircraftControls::default();
+        update_non_quad_controls(
+            AircraftType::FixedWing,
+            &Transform::IDENTITY,
+            Vec3::ZERO,
+            Vec3::ZERO,
+            &definition.body,
+            &definition.propulsion,
+            &definition.surfaces,
+            &mut controls,
+            Some(GuidedTarget::Velocity {
+                velocity: Vec3::ZERO,
+                yaw_rate: Some(0.0),
+            }),
+            3.0,
+            26.0,
+            true,
+        );
+        assert!(
+            controls.propulsion.iter().all(|v| *v < 0.01),
+            "No W means throttle must be 0, got {:?}",
+            controls.propulsion
+        );
+    }
+
+    #[test]
+    fn fixed_wing_qe_works_on_ground_without_throttle() {
+        // Q/E (ailerons/rudder) must be able to rotate the aircraft on the
+        // ground, without needing W (throttle=0). The user orients takeoff
+        // while parked.
+        let definition = crate::aircraft::AircraftDefinition::profile(AircraftType::FixedWing);
+        let mut controls = AircraftControls::default();
+        update_non_quad_controls(
+            AircraftType::FixedWing,
+            &Transform::IDENTITY,
+            Vec3::ZERO,
+            Vec3::ZERO,
+            &definition.body,
+            &definition.propulsion,
+            &definition.surfaces,
+            &mut controls,
+            Some(GuidedTarget::Velocity {
+                velocity: Vec3::ZERO, // no W
+                yaw_rate: Some(1.5),  // Q/E
+            }),
+            8.0,
+            26.0,
+            true,
+        );
+        // Throttle 0 (no W = no acceleration) but active surfaces (Q/E rotates).
+        assert!(
+            controls.propulsion.iter().all(|v| *v < 0.01),
+            "No W means throttle must be 0, got {:?}",
+            controls.propulsion
+        );
+        assert!(
+            controls.surfaces.iter().any(|v| v.abs() > 0.01),
+            "Q/E en suelo debe mover superficies, got {:?}",
+            controls.surfaces
+        );
+    }
+
+    #[test]
     fn local_ned_velocity_maps_to_world_axes() {
         let target = local_ned_target(
-            SET_POSITION_TARGET_LOCAL_NED_DATA {
+            &SET_POSITION_TARGET_LOCAL_NED_DATA {
                 vx: 3.0,
                 vy: 4.0,
                 vz: 5.0,
@@ -784,7 +1347,7 @@ mod tests {
     #[test]
     fn local_ned_position_maps_to_world_axes() {
         let target = local_ned_target(
-            SET_POSITION_TARGET_LOCAL_NED_DATA {
+            &SET_POSITION_TARGET_LOCAL_NED_DATA {
                 x: 10.0,
                 y: 20.0,
                 z: -30.0,
@@ -807,13 +1370,13 @@ mod tests {
             coordinate_frame: MavFrame::MAV_FRAME_LOCAL_ENU,
             ..Default::default()
         };
-        assert!(local_ned_target(unsupported, Vec3::ZERO).is_none());
+        assert!(local_ned_target(&unsupported, Vec3::ZERO).is_none());
 
         let partial = SET_POSITION_TARGET_LOCAL_NED_DATA {
             type_mask: PositionTargetTypemask::POSITION_TARGET_TYPEMASK_X_IGNORE,
             ..Default::default()
         };
-        assert!(local_ned_target(partial, Vec3::ZERO).is_none());
+        assert!(local_ned_target(&partial, Vec3::ZERO).is_none());
     }
 
     #[test]

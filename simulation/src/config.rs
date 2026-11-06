@@ -24,6 +24,10 @@ impl Default for SimConfig {
 #[derive(Resource, Default)]
 pub struct GizmosEnabled(pub bool);
 
+/// Optional navigation reference overlays (origin grid, route vector and range label).
+#[derive(Resource, Default)]
+pub struct GuidanceVisualsEnabled(pub bool);
+
 #[derive(Resource, Clone, Copy, Debug)]
 pub struct FlightControlLimits {
     pub max_speed_m_s: f32,
@@ -189,7 +193,7 @@ impl Default for BatteryConfig {
     }
 }
 
-#[derive(Resource, Clone, Debug)]
+#[derive(Component, Clone, Debug)]
 pub struct BatteryState {
     pub soc: f32, // 0..1
     pub current_a: f32,

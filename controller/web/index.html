@@ -1,0 +1,538 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#101820">
+  <title>VYDE Flight Controller</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      font: 15px/1.35 "IBM Plex Mono", "Roboto Mono", ui-monospace, monospace;
+      background: #05080b;
+      color: #d7e4e8;
+      --panel: #0b1117;
+      --panel-2: #101a21;
+      --line: #28414b;
+      --muted: #75909a;
+      --accent: #65f6d2;
+      --cyan: #66d9ff;
+      --danger: #ff5b61;
+      --amber: #ffbf5b;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; min-width: 320px; }
+    main { width: min(1280px, 100% - 28px); margin: 18px auto 42px; }
+    header { display: flex; justify-content: space-between; align-items: center; gap: 20px; margin-bottom: 14px; padding: 14px 0; border-top: 3px solid var(--accent); border-bottom: 1px solid var(--line); }
+    h1 { margin: 0; font-size: clamp(1.25rem, 3vw, 1.9rem); letter-spacing: .12em; }
+    h2 { margin: 0 0 14px; font-size: .9rem; letter-spacing: .12em; color: var(--cyan); text-transform: uppercase; }
+    p { margin: 6px 0; }
+    .subtle, small { color: var(--muted); }
+    .badge { border: 1px solid var(--accent); padding: 7px 12px; font-size: .76rem; white-space: nowrap; color: var(--accent); }
+    .grid { display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(340px, .75fr); gap: 10px; }
+    .panel { background: var(--panel); border: 1px solid var(--line); border-left: 3px solid var(--line); padding: 16px; box-shadow: 5px 5px 0 #020406; }
+    .wide { grid-column: 1 / -1; }
+    .telemetry { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
+    .metric { min-width: 0; padding: 10px; background: var(--panel-2); border: 1px solid #1c3038; }
+    .metric label { display: block; color: var(--muted); font-size: .78rem; margin-bottom: 5px; }
+    .metric strong { display: block; overflow-wrap: anywhere; font-size: .98rem; }
+    .video-frame { position: relative; overflow: hidden; background: #020406; border: 1px solid var(--accent); aspect-ratio: 16 / 9; }
+    .video-frame img, .video-frame video { display: block; width: 100%; height: 100%; object-fit: contain; }
+    .video-state { position: absolute; top: 10px; left: 10px; padding: 4px 9px; background: #05080eee; color: var(--muted); font-size: .76rem; }
+    .video-state.live { color: #09241d; background: var(--accent); }
+    .video-placeholder { position: absolute; inset: 0; display: grid; place-items: center; padding: 24px; color: var(--muted); text-align: center; pointer-events: none; }
+    .controls { display: grid; grid-template-columns: repeat(3, 64px); grid-template-rows: repeat(3, 56px); gap: 8px; justify-content: center; margin: 12px 0; }
+    button, input, select { font: inherit; }
+    button { min-height: 42px; color: #d7e4e8; background: #14222a; border: 1px solid #3b6974; border-radius: 0; cursor: pointer; touch-action: none; text-transform: uppercase; letter-spacing: .05em; }
+    button:hover { border-color: var(--accent); }
+    button:active, button.active { background: #176052; border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+    button.primary { color: #09241d; background: var(--accent); border-color: var(--accent); font-weight: 700; }
+    button.danger { color: white; background: #671e28; border-color: var(--danger); }
+    button.stop { width: 100%; margin-top: 6px; }
+    .move-n { grid-column: 2; grid-row: 1; }
+    .move-w { grid-column: 1; grid-row: 2; }
+    .move-s { grid-column: 2; grid-row: 2; }
+    .move-e { grid-column: 3; grid-row: 2; }
+    .move-center { grid-column: 2; grid-row: 3; }
+    .control-row, .form-row { display: flex; flex-wrap: wrap; gap: 8px; }
+    .control-row button { flex: 1; min-width: 100px; }
+    .vehicle-row { display: flex; flex-wrap: wrap; gap: 12px; align-items: end; }
+    .vehicle-row .field { flex: 2; min-width: 240px; }
+    select { width: 100%; padding: 9px 10px; color: #d7e4e8; background: #081016; border: 1px solid #3b6974; border-radius: 0; }
+    .form-row { align-items: end; margin-top: 12px; }
+    .field { flex: 1; min-width: 110px; }
+    .field label { display: block; margin-bottom: 5px; color: var(--muted); font-size: .82rem; }
+    input { width: 100%; padding: 9px 10px; color: #d7e4e8; background: #081016; border: 1px solid #3b6974; border-radius: 0; }
+    .form-row button { padding: 8px 14px; }
+    #message { min-height: 1.5em; color: var(--accent); }
+    .keys { color: var(--muted); text-align: center; font-size: .82rem; }
+    @media (max-width: 700px) {
+      main { width: min(100% - 20px, 520px); margin-top: 16px; }
+      .grid { grid-template-columns: 1fr; }
+      .wide { grid-column: auto; }
+      .telemetry { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .panel { padding: 16px; }
+    }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <div><h1>VYDE <span class="subtle">/ FLIGHT CONTROL</span></h1><p class="subtle">MAVLink backend interface</p></div>
+    <div id="mode" class="badge">CONNECTING</div>
+  </header>
+  <section class="grid">
+    <article class="panel wide">
+      <h2>Live camera</h2>
+      <div class="video-frame">
+        <video id="webrtc-video" autoplay playsinline muted hidden></video>
+        <img id="livestream" src="/api/v/1/video.mjpg" alt="Aircraft camera livestream">
+        <span id="video-state" class="video-state">WAITING FOR VIDEO</span>
+        <div id="video-placeholder" class="video-placeholder">Start the simulator video sender to view the live camera.</div>
+      </div>
+    </article>
+    <article class="panel wide">
+      <h2>Vehicle</h2>
+      <div class="vehicle-row">
+        <div class="field"><label for="vehicle-selector">Select vehicle</label><select id="vehicle-selector"></select></div>
+        <div class="field"><label>Link</label><strong id="vehicle-link">—</strong></div>
+      </div>
+      <p class="subtle">Each vehicle is controlled independently. Commands are only accepted once the vehicle is linked (MAVLink heartbeat received).</p>
+    </article>
+    <article class="panel wide">
+      <h2>Vehicle status</h2>
+      <div class="telemetry">
+        <div class="metric"><label>Vehicle</label><strong id="vehicle">Waiting for telemetry</strong></div>
+        <div class="metric"><label>Arming</label><strong id="armed">—</strong></div>
+        <div class="metric"><label>Position / altitude</label><strong id="position">—</strong></div>
+        <div class="metric"><label>Velocity NED</label><strong id="velocity">—</strong></div>
+        <div class="metric"><label>Attitude R / P / Y</label><strong id="attitude">—</strong></div>
+        <div class="metric"><label>Battery</label><strong id="battery">—</strong></div>
+        <div class="metric"><label>Manual setpoint</label><strong id="manual">Idle</strong></div>
+        <div class="metric"><label>Speed / accel / tilt</label><strong id="tuning">—</strong></div>
+      </div>
+      <p id="message" aria-live="polite"></p>
+    </article>
+    <article class="panel">
+      <h2>Flight controls</h2>
+      <div class="controls" aria-label="Directional controls">
+        <button class="move-n" data-control="w" aria-label="Forward">▲</button>
+        <button class="move-w" data-control="a" aria-label="Left">◀</button>
+        <button class="move-s" data-control="s" aria-label="Backward">▼</button>
+        <button class="move-e" data-control="d" aria-label="Right">▶</button>
+        <button class="move-center" id="hold-pad" aria-label="Hold position">HOLD</button>
+      </div>
+      <div class="control-row">
+        <button data-control=" " aria-label="Climb">Climb</button>
+        <button data-control="x" aria-label="Descend">Descend</button>
+        <button data-control="q" aria-label="Yaw left">Yaw left</button>
+        <button data-control="e" aria-label="Yaw right">Yaw right</button>
+      </div>
+      <button id="stop" class="stop danger">STOP / HOLD</button>
+      <p class="keys">Keyboard: W A S D · Space / X · Q / E</p>
+    </article>
+    <article class="panel">
+      <h2>Flight actions</h2>
+      <div class="control-row">
+        <button class="primary" data-command="arm">Arm</button>
+        <button data-command="disarm">Disarm</button>
+      </div>
+      <div class="form-row">
+        <div class="field"><label for="altitude">Takeoff altitude (m)</label><input id="altitude" type="number" min="0.5" step="0.5" value="5"></div>
+        <button data-command-form="takeoff">Take off</button>
+        <button data-command="land">Land</button>
+        <button data-command="rtl">Return home</button>
+      </div>
+      <div class="form-row">
+        <div class="field"><label for="latitude">Latitude</label><input id="latitude" type="number" step="any" placeholder="37.4"></div>
+        <div class="field"><label for="longitude">Longitude</label><input id="longitude" type="number" step="any" placeholder="-122.1"></div>
+        <div class="field"><label for="goto-altitude">Altitude (m)</label><input id="goto-altitude" type="number" min="0" step="any" value="5"></div>
+        <button data-command-form="goto">Go to</button>
+      </div>
+      <div class="form-row">
+        <div class="field"><label for="speed">Max speed (m/s) — no limit</label><input id="speed" type="number" min="0.1" step="0.5" value="3"></div>
+        <button data-command-form="speed">Set speed</button>
+        <div class="field"><label for="accel">Max acceleration (m/s²) — no limit</label><input id="accel" type="number" min="0.1" step="0.5" value="8"></div>
+        <button data-command-form="accel">Set accel</button>
+        <div class="field"><label for="tilt">Max tilt (°)</label><input id="tilt" type="number" min="5" max="60" step="1" value="26"></div>
+        <button data-command-form="tilt">Set tilt</button>
+      </div>
+    </article>
+    <article class="panel wide">
+      <h2>Real-time charts</h2>
+      <div class="telemetry" style="margin-bottom:12px">
+        <div class="metric"><label>HTTP latency (ms)</label><strong id="chart-latency-val">—</strong></div>
+        <div class="metric"><label>Ground speed (m/s)</label><strong id="chart-speed-val">—</strong></div>
+        <div class="metric"><label>Altitude (m)</label><strong id="chart-alt-val">—</strong></div>
+        <div class="metric"><label>Battery (%)</label><strong id="chart-batt-val">—</strong></div>
+      </div>
+      <canvas id="chart-latency" height="90" style="width:100%;background:#111c23;border-radius:8px"></canvas>
+      <canvas id="chart-speed" height="90" style="width:100%;background:#111c23;border-radius:8px;margin-top:8px"></canvas>
+      <canvas id="chart-battery" height="90" style="width:100%;background:#111c23;border-radius:8px;margin-top:8px"></canvas>
+    </article>
+    <article class="panel wide">
+      <h2>Backend API</h2>
+      <p class="subtle">This interface uses <code>GET /api/vehicles</code>, <code>GET /api/v/:id/state</code>, <code>POST /api/v/:id/command</code>, <code>POST /api/v/:id/manual</code> and <code>POST /api/v/:id/stop</code>. Manual inputs expire automatically if a client stops sending updates. The legacy single-vehicle endpoints (<code>/api/state</code>, <code>/api/command</code>, <code>/api/manual</code>, <code>/api/stop</code>) map to vehicle 1.</p>
+    </article>
+  </section>
+</main>
+<script>
+  const active = new Set();
+  const keyMap = { w: "w", ArrowUp: "w", s: "s", ArrowDown: "s", a: "a", ArrowLeft: "a", d: "d", ArrowRight: "d", q: "q", e: "e", x: "x", " ": " " };
+  const manualZero = { north: 0, east: 0, down: 0, yaw_rate: 0 };
+  let latestManual = null;
+  let sendingManual = false;
+  let selectedVehicle = 1;
+  let knownVehicles = [];
+
+  function vehiclePath(suffix) {
+    return `/api/v/${selectedVehicle}${suffix}`;
+  }
+
+  function setMessage(message, isError = false) {
+    const node = document.getElementById("message");
+    node.textContent = message || "";
+    node.style.color = isError ? "var(--danger)" : "var(--accent)";
+  }
+
+  async function request(path, body) {
+    const response = await fetch(path, {
+      method: body === undefined ? "GET" : "POST",
+      headers: body === undefined ? {} : { "Content-Type": "application/json" },
+      body: body === undefined ? undefined : JSON.stringify(body)
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data.message || `Request failed (${response.status})`);
+    return data;
+  }
+
+  function inputFromControls() {
+    const north = Number(active.has("w")) - Number(active.has("s"));
+    const east = Number(active.has("a")) - Number(active.has("d"));
+    const scale = Math.max(1, Math.hypot(north, east));
+    return {
+      north: north / scale * currentSpeed,
+      east: east / scale * currentSpeed,
+      down: Number(active.has("x")) * 2 - Number(active.has(" ")) * 2,
+      yaw_rate: Number(active.has("q")) * 1.5 - Number(active.has("e")) * 1.5
+    };
+  }
+
+  let currentSpeed = 3;
+  function updateManual() {
+    latestManual = active.size ? inputFromControls() : manualZero;
+    flushManual();
+  }
+
+  async function flushManual() {
+    if (sendingManual) return;
+    sendingManual = true;
+    try {
+      while (latestManual) {
+        const input = latestManual;
+        latestManual = null;
+        const result = await request(vehiclePath("/manual"), input);
+        if (input === manualZero) setMessage(result.message);
+      }
+    } catch (error) {
+      setMessage(error.message, true);
+    } finally {
+      sendingManual = false;
+      if (latestManual) flushManual();
+    }
+  }
+
+  function addControl(control, button) {
+    if (!active.has(control)) {
+      active.add(control);
+      if (button) button.classList.add("active");
+      updateManual();
+    }
+  }
+  function removeControl(control, button) {
+    if (active.delete(control)) {
+      if (button) button.classList.remove("active");
+      updateManual();
+    }
+  }
+  function clearControls() {
+    active.clear();
+    document.querySelectorAll("[data-control]").forEach(button => button.classList.remove("active"));
+    updateManual();
+  }
+
+  document.querySelectorAll("[data-control]").forEach(button => {
+    const control = button.dataset.control;
+    button.addEventListener("pointerdown", event => {
+      event.preventDefault();
+      button.setPointerCapture(event.pointerId);
+      addControl(control, button);
+    });
+    button.addEventListener("pointerup", () => removeControl(control, button));
+    button.addEventListener("pointercancel", () => removeControl(control, button));
+    button.addEventListener("lostpointercapture", () => removeControl(control, button));
+  });
+
+  document.addEventListener("keydown", event => {
+    if (event.target instanceof HTMLInputElement) return;
+    const control = keyMap[event.key] || (event.key === "Shift" ? "x" : null);
+    if (!control) return;
+    event.preventDefault();
+    addControl(control, document.querySelector(`[data-control="${CSS.escape(control)}"]`));
+  });
+  document.addEventListener("keyup", event => {
+    const control = keyMap[event.key] || (event.key === "Shift" ? "x" : null);
+    if (control) removeControl(control, document.querySelector(`[data-control="${CSS.escape(control)}"]`));
+  });
+  window.addEventListener("blur", clearControls);
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) clearControls();
+  });
+  document.getElementById("stop").addEventListener("click", async () => {
+    clearControls();
+    try { setMessage((await request(vehiclePath("/stop"), {})).message); }
+    catch (error) { setMessage(error.message, true); }
+  });
+  document.getElementById("hold-pad").addEventListener("click", () => {
+    document.getElementById("stop").click();
+  });
+
+  async function sendCommand(command) {
+    clearControls();
+    try { setMessage((await request(vehiclePath("/command"), { command })).message); }
+    catch (error) { setMessage(error.message, true); }
+  }
+  document.querySelectorAll("[data-command]").forEach(button => {
+    button.addEventListener("click", () => sendCommand(button.dataset.command));
+  });
+  document.querySelectorAll("[data-command-form]").forEach(button => {
+    button.addEventListener("click", () => {
+      const command = button.dataset.commandForm;
+      let value;
+      if (command === "takeoff") value = `takeoff ${document.getElementById("altitude").value}`;
+      if (command === "goto") {
+        value = `goto ${document.getElementById("latitude").value} ${document.getElementById("longitude").value} ${document.getElementById("goto-altitude").value}`;
+      }
+      if (["speed", "accel", "tilt"].includes(command)) {
+        value = `${command} ${document.getElementById(command).value}`;
+        if (command === "speed") currentSpeed = Number(document.getElementById("speed").value);
+      }
+      sendCommand(value);
+    });
+  });
+
+  function displayArray(values, digits = 1) {
+    return values ? values.map(value => Number(value).toFixed(digits)).join(" / ") : "—";
+  }
+  async function refreshState() {
+    try {
+      const t0 = performance.now();
+      const state = await request(vehiclePath("/state"));
+      const latency = performance.now() - t0;
+      pushSample("latency", latency);
+      const telemetry = state.telemetry;
+      document.getElementById("mode").textContent = `${state.control_mode} · ${telemetry.armed ? "ARMED" : "DISARMED"}`;
+      document.getElementById("vehicle").textContent = `Vehicle ${state.vehicle_id}${telemetry.vehicle ? ` · ${telemetry.vehicle}` : ""}`;
+      const linkNode = document.getElementById("vehicle-link");
+      if (linkNode) linkNode.textContent = state.linked ? `LINKED${state.last_seen_secs_ago != null ? ` (seen ${state.last_seen_secs_ago}s ago)` : ""}` : "NOT LINKED";
+      document.getElementById("armed").textContent = telemetry.armed ? "ARMED" : "DISARMED";
+      document.getElementById("position").textContent = telemetry.position
+        ? `${Number(telemetry.position[0]).toFixed(6)}, ${Number(telemetry.position[1]).toFixed(6)} · ${Number(telemetry.position[3]).toFixed(1)} m rel.`
+        : "—";
+      document.getElementById("velocity").textContent = displayArray(telemetry.position?.slice(4, 7));
+      document.getElementById("attitude").textContent = displayArray(telemetry.attitude_deg);
+      document.getElementById("battery").textContent = telemetry.battery
+        ? `${Number(telemetry.battery[0]).toFixed(2)} V · ${Number(telemetry.battery[2]).toFixed(0)}%`
+        : "—";
+      document.getElementById("manual").textContent = state.manual_input
+        ? `N ${state.manual_input.north.toFixed(1)} · E ${state.manual_input.east.toFixed(1)} · D ${state.manual_input.down.toFixed(1)}`
+        : "Idle";
+      document.getElementById("tuning").textContent =
+        `${state.flight_tuning.max_speed_m_s.toFixed(1)} / ${state.flight_tuning.max_acceleration_m_s2.toFixed(1)} / ${state.flight_tuning.max_tilt_deg.toFixed(0)}`;
+      currentSpeed = state.flight_tuning.max_speed_m_s;
+      if (!document.getElementById("message").textContent) setMessage(state.status);
+      // --- Real-time charts ---
+      const speed = telemetry.position
+        ? Math.hypot(telemetry.position[4], telemetry.position[5], telemetry.position[6])
+        : 0;
+      const alt = telemetry.position ? Number(telemetry.position[3]) : 0;
+      const batt = telemetry.battery ? Number(telemetry.battery[2]) : 0;
+      pushSample("speed", speed);
+      pushSample("altitude", alt);
+      pushSample("battery", batt);
+      document.getElementById("chart-latency-val").textContent = latency.toFixed(1);
+      document.getElementById("chart-speed-val").textContent = speed.toFixed(1);
+      document.getElementById("chart-alt-val").textContent = alt.toFixed(1);
+      document.getElementById("chart-batt-val").textContent = batt.toFixed(0);
+    } catch (error) {
+      document.getElementById("mode").textContent = "OFFLINE";
+      setMessage(error.message, true);
+    }
+  }
+
+  // --- Real-time charts (canvas, no dependencies) ---
+  const chartData = { latency: [], speed: [], altitude: [], battery: [] };
+  const MAX_SAMPLES = 120; // 60 s at 500 ms
+  function pushSample(key, value) {
+    chartData[key].push(value);
+    if (chartData[key].length > MAX_SAMPLES) chartData[key].shift();
+    drawChart("chart-latency", chartData.latency, "#6ee7c1", 500);
+    drawChart("chart-speed", chartData.speed, "#4f8cff", 30);
+    drawChart("chart-battery", chartData.battery, "#ffb84f", 100);
+  }
+  function drawChart(id, data, color, max) {
+    const canvas = document.getElementById(id);
+    if (!canvas || data.length < 2) return;
+    const ctx = canvas.getContext("2d");
+    const w = canvas.width = canvas.offsetWidth;
+    const h = canvas.height;
+    ctx.clearRect(0, 0, w, h);
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    data.forEach((v, i) => {
+      const x = (i / (MAX_SAMPLES - 1)) * w;
+      const y = h - Math.min(v / max, 1) * (h - 4) - 2;
+      i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+    // fill under curve
+    ctx.lineTo(w, h); ctx.lineTo(0, h); ctx.closePath();
+    ctx.globalAlpha = 0.15; ctx.fillStyle = color; ctx.fill(); ctx.globalAlpha = 1;
+  }
+
+  function updateVideoSource() {
+    const img = document.getElementById("livestream");
+    const next = vehiclePath("/video.mjpg");
+    if (img.getAttribute("src") !== next) img.src = next;
+    startWebRTC();
+    refreshVideoStatus();
+  }
+  document.getElementById("livestream").addEventListener("error", () => {
+    const badge = document.getElementById("video-state");
+    badge.textContent = "NO SIGNAL";
+    badge.classList.remove("live");
+    document.getElementById("video-placeholder").hidden = false;
+  });
+
+  async function refreshVideoStatus() {
+    const badge = document.getElementById("video-state");
+    const placeholder = document.getElementById("video-placeholder");
+    try {
+      const state = await request(vehiclePath("/video/status"));
+      const live = state.live || webrtcLive;
+      badge.textContent = webrtcLive ? "WEBRTC LIVE" : live ? "LIVE" : "NO VIDEO";
+      badge.classList.toggle("live", live);
+      placeholder.hidden = live;
+    } catch (error) {
+      badge.textContent = "VIDEO ERROR";
+      badge.classList.remove("live");
+      placeholder.hidden = false;
+      placeholder.textContent = error.message;
+    }
+
+    let peerConnection = null;
+    let webrtcLive = false;
+    let webrtcGeneration = 0;
+    function waitForIceGathering(pc) {
+      if (pc.iceGatheringState === "complete") return Promise.resolve();
+      return new Promise(resolve => {
+        const check = () => {
+          if (pc.iceGatheringState === "complete") {
+            pc.removeEventListener("icegatheringstatechange", check);
+            resolve();
+          }
+        };
+        pc.addEventListener("icegatheringstatechange", check);
+      });
+    }
+    async function startWebRTC() {
+      const generation = ++webrtcGeneration;
+      webrtcLive = false;
+      if (peerConnection) peerConnection.close();
+      const video = document.getElementById("webrtc-video");
+      const img = document.getElementById("livestream");
+      try {
+        const pc = new RTCPeerConnection({ iceServers: [] });
+        peerConnection = pc;
+        pc.addTransceiver("video", { direction: "recvonly" });
+        pc.ontrack = event => {
+          if (generation !== webrtcGeneration) return;
+          video.srcObject = event.streams[0] || new MediaStream([event.track]);
+          video.hidden = false;
+          img.hidden = true;
+        };
+        pc.onconnectionstatechange = () => {
+          if (generation !== webrtcGeneration) return;
+          if (["failed", "closed", "disconnected"].includes(pc.connectionState)) {
+            webrtcLive = false;
+            video.hidden = true;
+            img.hidden = false;
+          }
+        };
+        video.onplaying = () => {
+          webrtcLive = true;
+          document.getElementById("video-state").textContent = "WEBRTC LIVE";
+          document.getElementById("video-state").classList.add("live");
+          document.getElementById("video-placeholder").hidden = true;
+        };
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        await waitForIceGathering(pc);
+        const answer = await request(vehiclePath("/webrtc/offer"), pc.localDescription);
+        await pc.setRemoteDescription(answer);
+      } catch (error) {
+        if (generation === webrtcGeneration) {
+          webrtcLive = false;
+          video.hidden = true;
+          img.hidden = false;
+        }
+      }
+    }
+  }
+
+  async function refreshVehicles() {
+    try {
+      const vehicles = await request("/api/vehicles");
+      knownVehicles = vehicles;
+      const selector = document.getElementById("vehicle-selector");
+      const signature = vehicles.map(v => v.vehicle_id).join(",");
+      if (selector.dataset.signature !== signature) {
+        selector.dataset.signature = signature;
+        selector.replaceChildren(...vehicles.map(v => {
+          const option = document.createElement("option");
+          option.value = String(v.vehicle_id);
+          option.textContent = `Vehicle ${v.vehicle_id}${v.linked ? " (linked)" : " (not linked)"}`;
+          return option;
+        }));
+      }
+      if (!vehicles.some(v => v.vehicle_id === selectedVehicle) && vehicles.length) {
+        selectedVehicle = vehicles[0].vehicle_id;
+        clearControls();
+      }
+      selector.value = String(selectedVehicle);
+    } catch (error) {
+      // Selector stays empty until the backend is reachable.
+    }
+  }
+  document.getElementById("vehicle-selector")?.addEventListener("change", event => {
+    selectedVehicle = Number(event.target.value) || 1;
+    clearControls();
+    setMessage("");
+    updateVideoSource();
+    refreshState();
+  });
+
+  setInterval(() => {
+    if (active.size) updateManual();
+  }, 100);
+  refreshVehicles();
+  setInterval(refreshVehicles, 2000);
+  updateVideoSource();
+  refreshState();
+  setInterval(refreshState, 500);
+  refreshVideoStatus();
+  setInterval(refreshVideoStatus, 1000);
+</script>
+</body>
+</html>
